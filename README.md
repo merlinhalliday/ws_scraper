@@ -32,5 +32,3 @@ To inspect or stop tmux sessions:
 tmux ls
 tmux kill-session -t scraper
 ```
-
-
