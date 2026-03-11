@@ -36,6 +36,11 @@ try:
 except Exception:
     msal = None
 
+try:
+    from azure.identity import DefaultAzureCredential
+except Exception:
+    DefaultAzureCredential = None
+
 
 COINBASE_PRODUCTS = ("BTC-USD", "ETH-USD")
 COINBASE_MARKET_KEY = {
@@ -79,12 +84,18 @@ class CollectorConfig:
     graph_client_id: str
     graph_authority: str
     graph_scopes: tuple[str, ...]
+    graph_client_secret: str
+    graph_client_certificate_path: str
+    graph_client_certificate_password: str
+    graph_client_certificate_thumbprint: str
+    graph_use_managed_identity: bool
+    graph_managed_identity_client_id: str
+    graph_onedrive_target: str
     onedrive_folder: str
     rotate_upload_threshold_bytes: int
     graph_max_single_upload_bytes: int
     graph_upload_backoff_seconds: tuple[float, ...]
     graph_upload_timeout_seconds: float
-    graph_token_cache_path: Path
 
 
 @dataclass(frozen=True)
@@ -222,6 +233,13 @@ def sanitize_graph_scopes(scopes: tuple[str, ...]) -> tuple[tuple[str, ...], tup
         keep.append(scope)
 
     return tuple(keep), tuple(removed)
+
+
+def normalize_graph_onedrive_target(value: Any) -> str:
+    target = normalize_env_scalar(value).strip().lower()
+    if target in {"app", "sites", "site", "sharepoint"}:
+        return "sites"
+    return "me"
 
 
 def normalize_onedrive_folder(value: Any) -> str:
@@ -1199,68 +1217,104 @@ class WsSnapshotAggregator:
 
 
 class GraphAuthManager:
-    def __init__(self, client_id: str, authority: str, scopes: tuple[str, ...], cache_path: Path):
+    def __init__(
+        self,
+        client_id: str,
+        authority: str,
+        scopes: tuple[str, ...],
+        client_secret: str,
+        client_certificate_path: str,
+        client_certificate_password: str,
+        client_certificate_thumbprint: str,
+        use_managed_identity: bool,
+        managed_identity_client_id: str,
+    ):
         if msal is None:
             raise RuntimeError("missing_dependency:msal (pip install msal)")
         self.client_id = normalize_env_scalar(client_id)
         self.authority = normalize_env_scalar(authority)
         self.scopes = tuple(scopes)
-        self.cache_path = Path(cache_path)
+        self.client_secret = normalize_env_scalar(client_secret)
+        self.client_certificate_path = normalize_env_scalar(client_certificate_path)
+        self.client_certificate_password = normalize_env_scalar(client_certificate_password)
+        self.client_certificate_thumbprint = normalize_env_scalar(client_certificate_thumbprint)
+        self.use_managed_identity = bool(use_managed_identity)
+        self.managed_identity_client_id = normalize_env_scalar(managed_identity_client_id)
         self._lock = threading.Lock()
-        self._cache = msal.SerializableTokenCache()
-        if self.cache_path.exists():
-            try:
-                payload = self.cache_path.read_text(encoding="utf-8")
-                if payload.strip():
-                    self._cache.deserialize(payload)
-            except Exception:
-                pass
-        self._app = msal.PublicClientApplication(
+
+        self._app: Any = None
+        self._credential: Any = None
+
+        if self.use_managed_identity:
+            if DefaultAzureCredential is None:
+                raise RuntimeError("missing_dependency:azure-identity (pip install azure-identity)")
+            client_id_opt = self.managed_identity_client_id or None
+            self._credential = DefaultAzureCredential(managed_identity_client_id=client_id_opt)
+            return
+
+        credential_count = int(bool(self.client_secret)) + int(bool(self.client_certificate_path))
+        if credential_count != 1:
+            raise RuntimeError(
+                "graph_app_auth_invalid_credentials:provide_exactly_one_of_"
+                "GRAPH_CLIENT_SECRET_or_GRAPH_CLIENT_CERTIFICATE_PATH"
+            )
+
+        client_credential: Any
+        if self.client_secret:
+            client_credential = self.client_secret
+        else:
+            cert_payload: dict[str, str] = {"private_key": Path(self.client_certificate_path).read_text(encoding="utf-8")}
+            if self.client_certificate_password:
+                cert_payload["passphrase"] = self.client_certificate_password
+            if self.client_certificate_thumbprint:
+                cert_payload["thumbprint"] = self.client_certificate_thumbprint
+            client_credential = cert_payload
+
+        self._app = msal.ConfidentialClientApplication(
             client_id=self.client_id,
             authority=self.authority,
-            token_cache=self._cache,
+            client_credential=client_credential,
         )
 
-    def _persist_cache_unlocked(self) -> None:
-        if not self._cache.has_state_changed:
-            return
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = self._cache.serialize()
-        tmp_path = self.cache_path.with_suffix(self.cache_path.suffix + ".tmp")
-        tmp_path.write_text(payload, encoding="utf-8")
-        tmp_path.replace(self.cache_path)
+    @staticmethod
+    def _scope_to_resource(scope: str) -> str:
+        scope_text = normalize_env_scalar(scope)
+        if scope_text.endswith("/.default"):
+            return scope_text
+        if "/" not in scope_text:
+            return "https://graph.microsoft.com/.default"
+        resource = scope_text.rsplit("/", 1)[0]
+        return f"{resource}/.default"
 
-    def _try_silent_unlocked(self) -> str:
-        accounts = self._app.get_accounts()
-        for account in accounts:
-            result = self._app.acquire_token_silent(scopes=list(self.scopes), account=account)
-            if isinstance(result, dict) and result.get("access_token"):
-                self._persist_cache_unlocked()
-                return str(result.get("access_token"))
-        return ""
+    def _app_only_scopes(self) -> list[str]:
+        resources: list[str] = []
+        seen: set[str] = set()
+        for scope in self.scopes:
+            normalized = self._scope_to_resource(scope)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            resources.append(normalized)
+        if not resources:
+            resources.append("https://graph.microsoft.com/.default")
+        return resources
 
-    def acquire_access_token(self, allow_device_flow: bool) -> str:
+    def acquire_access_token(self) -> str:
+        scopes = self._app_only_scopes()
         with self._lock:
-            token = self._try_silent_unlocked()
+            if self._credential is not None:
+                token = self._credential.get_token(*scopes)
+                value = str(getattr(token, "token", "") or "").strip()
+                if not value:
+                    raise RuntimeError("graph_managed_identity_token_empty")
+                return value
+
+            result = self._app.acquire_token_for_client(scopes=scopes)
+            token = str((result or {}).get("access_token") or "").strip()
             if token:
                 return token
-            if not allow_device_flow:
-                raise RuntimeError("graph_token_unavailable_silent")
-            flow = self._app.initiate_device_flow(scopes=list(self.scopes))
-            if not isinstance(flow, dict) or not flow.get("user_code"):
-                raise RuntimeError(f"graph_device_flow_init_failed:{flow}")
-            message = str(flow.get("message") or "").strip()
-
-        if message:
-            print(message)
-        result = self._app.acquire_token_by_device_flow(flow)
-        token = str((result or {}).get("access_token") or "").strip()
-        if not token:
             detail = str((result or {}).get("error_description") or (result or {}).get("error") or "unknown_error")
-            raise RuntimeError(f"graph_device_flow_failed:{detail}")
-        with self._lock:
-            self._persist_cache_unlocked()
-        return token
+            raise RuntimeError(f"graph_app_token_failed:{detail}")
 
 
 class GraphUploader:
@@ -1268,12 +1322,14 @@ class GraphUploader:
         self,
         auth_manager: GraphAuthManager,
         onedrive_folder: str,
+        onedrive_target: str,
         timeout_seconds: float,
         backoff_seconds: tuple[float, ...],
         max_single_upload_bytes: int,
     ):
         self.auth_manager = auth_manager
         self.onedrive_folder = normalize_onedrive_folder(onedrive_folder)
+        self.onedrive_target = normalize_graph_onedrive_target(onedrive_target)
         self.timeout_seconds = max(1.0, float(timeout_seconds))
         self.backoff_seconds = tuple(backoff_seconds) if backoff_seconds else (2.0, 5.0, 15.0, 30.0, 60.0)
         self.max_single_upload_bytes = max(1_000_000, int(max_single_upload_bytes))
@@ -1286,11 +1342,12 @@ class GraphUploader:
         self._retry_attempts = 0
 
     @staticmethod
-    def _upload_url(onedrive_folder: str, date_str: str, filename: str) -> str:
+    def _upload_url(onedrive_target: str, onedrive_folder: str, date_str: str, filename: str) -> str:
         segments = [s for s in onedrive_folder.split("/") if s]
         segments.extend([date_str, filename])
         encoded = "/".join(quote(seg, safe="") for seg in segments)
-        return f"{GRAPH_API_BASE}/me/drive/root:/{encoded}:/content"
+        drive_selector = "me" if onedrive_target == "me" else "sites/root"
+        return f"{GRAPH_API_BASE}/{drive_selector}/drive/root:/{encoded}:/content"
 
     def start(self) -> None:
         if self._thread is not None:
@@ -1325,8 +1382,8 @@ class GraphUploader:
                 f"file_too_large_for_single_upload:size={job.size_bytes},"
                 f"max={self.max_single_upload_bytes}"
             )
-        token = self.auth_manager.acquire_access_token(allow_device_flow=False)
-        url = self._upload_url(self.onedrive_folder, job.date_str, job.filename)
+        token = self.auth_manager.acquire_access_token()
+        url = self._upload_url(self.onedrive_target, self.onedrive_folder, job.date_str, job.filename)
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/octet-stream",
@@ -1683,6 +1740,13 @@ def build_collector_config(args: argparse.Namespace, runtime_cfg: RuntimeConfig)
     graph_authority = normalize_env_scalar(os.getenv("GRAPH_AUTHORITY"))
     graph_scopes_raw = parse_graph_scopes(os.getenv("GRAPH_SCOPES"))
     graph_scopes, removed_reserved_scopes = sanitize_graph_scopes(graph_scopes_raw)
+    graph_client_secret = normalize_env_scalar(os.getenv("GRAPH_CLIENT_SECRET"))
+    graph_client_certificate_path = normalize_env_scalar(os.getenv("GRAPH_CLIENT_CERTIFICATE_PATH"))
+    graph_client_certificate_password = normalize_env_scalar(os.getenv("GRAPH_CLIENT_CERTIFICATE_PASSWORD"))
+    graph_client_certificate_thumbprint = normalize_env_scalar(os.getenv("GRAPH_CLIENT_CERTIFICATE_THUMBPRINT"))
+    graph_use_managed_identity = parse_env_bool("GRAPH_USE_MANAGED_IDENTITY", False)
+    graph_managed_identity_client_id = normalize_env_scalar(os.getenv("GRAPH_MANAGED_IDENTITY_CLIENT_ID"))
+    graph_onedrive_target = normalize_graph_onedrive_target(os.getenv("GRAPH_ONEDRIVE_TARGET"))
     onedrive_folder = normalize_onedrive_folder(os.getenv("ONEDRIVE_FOLDER"))
 
     rotate_threshold_raw = normalize_env_scalar(os.getenv("ROTATE_UPLOAD_THRESHOLD_BYTES"))
@@ -1712,18 +1776,16 @@ def build_collector_config(args: argparse.Namespace, runtime_cfg: RuntimeConfig)
         (2.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0),
     )
 
-    graph_token_cache_path = APP_ROOT / ".graph_token_cache.bin"
-
     if graph_upload_enabled:
         missing: list[str] = []
-        if not graph_client_id:
-            missing.append("GRAPH_CLIENT_ID")
-        if not graph_authority:
-            missing.append("GRAPH_AUTHORITY")
         if not graph_scopes_raw:
             missing.append("GRAPH_SCOPES")
         if not onedrive_folder:
             missing.append("ONEDRIVE_FOLDER")
+        if not graph_use_managed_identity and not graph_client_id:
+            missing.append("GRAPH_CLIENT_ID")
+        if not graph_use_managed_identity and not graph_authority:
+            missing.append("GRAPH_AUTHORITY")
         if missing:
             joined = ",".join(missing)
             raise RuntimeError(f"graph_upload_enabled_but_missing_env:{joined}")
@@ -1737,6 +1799,19 @@ def build_collector_config(args: argparse.Namespace, runtime_cfg: RuntimeConfig)
                 "Warning: GRAPH_SCOPES contains reserved scopes that were ignored "
                 f"(removed={removed_reserved_scopes}, effective={graph_scopes})."
             )
+
+        if graph_use_managed_identity:
+            if graph_client_secret or graph_client_certificate_path:
+                raise RuntimeError(
+                    "graph_auth_invalid_env:GRAPH_USE_MANAGED_IDENTITY cannot be combined with "
+                    "GRAPH_CLIENT_SECRET or GRAPH_CLIENT_CERTIFICATE_PATH"
+                )
+        else:
+            if bool(graph_client_secret) == bool(graph_client_certificate_path):
+                raise RuntimeError(
+                    "graph_auth_invalid_env:provide_exactly_one_of_GRAPH_CLIENT_SECRET_or_"
+                    "GRAPH_CLIENT_CERTIFICATE_PATH"
+                )
 
     return CollectorConfig(
         output_root=Path(args.output_root),
@@ -1756,12 +1831,18 @@ def build_collector_config(args: argparse.Namespace, runtime_cfg: RuntimeConfig)
         graph_client_id=graph_client_id,
         graph_authority=graph_authority,
         graph_scopes=graph_scopes,
+        graph_client_secret=graph_client_secret,
+        graph_client_certificate_path=graph_client_certificate_path,
+        graph_client_certificate_password=graph_client_certificate_password,
+        graph_client_certificate_thumbprint=graph_client_certificate_thumbprint,
+        graph_use_managed_identity=graph_use_managed_identity,
+        graph_managed_identity_client_id=graph_managed_identity_client_id,
+        graph_onedrive_target=graph_onedrive_target,
         onedrive_folder=onedrive_folder,
         rotate_upload_threshold_bytes=rotate_threshold_bytes,
         graph_max_single_upload_bytes=graph_max_single_upload_bytes,
         graph_upload_backoff_seconds=graph_upload_backoff_seconds,
         graph_upload_timeout_seconds=graph_upload_timeout_seconds,
-        graph_token_cache_path=graph_token_cache_path,
     )
 
 
@@ -1790,13 +1871,18 @@ def run(argv: Optional[list[str]] = None) -> None:
             client_id=cfg.graph_client_id,
             authority=cfg.graph_authority,
             scopes=cfg.graph_scopes,
-            cache_path=cfg.graph_token_cache_path,
+            client_secret=cfg.graph_client_secret,
+            client_certificate_path=cfg.graph_client_certificate_path,
+            client_certificate_password=cfg.graph_client_certificate_password,
+            client_certificate_thumbprint=cfg.graph_client_certificate_thumbprint,
+            use_managed_identity=cfg.graph_use_managed_identity,
+            managed_identity_client_id=cfg.graph_managed_identity_client_id,
         )
-        # Startup requirement: block for device code flow when no cached token is available.
-        auth_manager.acquire_access_token(allow_device_flow=True)
+        auth_manager.acquire_access_token()
         uploader = GraphUploader(
             auth_manager=auth_manager,
             onedrive_folder=cfg.onedrive_folder,
+            onedrive_target=cfg.graph_onedrive_target,
             timeout_seconds=cfg.graph_upload_timeout_seconds,
             backoff_seconds=cfg.graph_upload_backoff_seconds,
             max_single_upload_bytes=cfg.graph_max_single_upload_bytes,
