@@ -3,12 +3,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import os
 import queue
 import re
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -85,6 +89,15 @@ class CollectorConfig:
     graph_upload_backoff_seconds: tuple[float, ...]
     graph_upload_timeout_seconds: float
     graph_token_cache_path: Path
+    health_host: str
+    health_port: int
+    azure_log_analytics_workspace_id: str
+    azure_log_analytics_shared_key: str
+    azure_log_analytics_log_type: str
+    alert_no_data_minutes: int
+    alert_reconnect_storm_count: int
+    alert_queue_growth_minutes: int
+    alert_export_failure_threshold: float
 
 
 @dataclass(frozen=True)
@@ -129,6 +142,120 @@ class UploadJob:
     market_key: str
     filename: str
     size_bytes: int
+
+
+def log_event(event_type: str, **fields: Any) -> None:
+    payload: dict[str, Any] = {
+        "ts": datetime.now(tz=timezone.utc).isoformat(),
+        "event_type": str(event_type),
+    }
+    payload.update(fields)
+    print(json.dumps(payload, separators=(",", ":"), default=str), flush=True)
+
+
+@dataclass
+class WorkerHeartbeat:
+    worker: str
+    ws_freshness_seconds: float = 0.0
+    queue_backlog: int = 0
+    blob_write_success_rate: float = 1.0
+    export_lag_seconds: float = 0.0
+    reconnect_count: int = 0
+    last_update_unix: float = 0.0
+
+
+class HealthServer:
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = int(port)
+        self._lock = threading.Lock()
+        self._workers: dict[str, WorkerHeartbeat] = {}
+        self._thread: Optional[threading.Thread] = None
+        self._httpd: Optional[ThreadingHTTPServer] = None
+
+    def update(self, heartbeat: WorkerHeartbeat) -> None:
+        with self._lock:
+            self._workers[heartbeat.worker] = heartbeat
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            workers = {k: vars(v).copy() for k, v in self._workers.items()}
+        ready = bool(workers) and all(v.get("ws_freshness_seconds", 9999) < 120 for v in workers.values())
+        return {
+            "ts": datetime.now(tz=timezone.utc).isoformat(),
+            "ready": ready,
+            "workers": workers,
+        }
+
+    def start(self) -> None:
+        if self.port <= 0 or self._thread is not None:
+            return
+        parent = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                snap = parent.snapshot()
+                if self.path in {"/health", "/healthz", "/metrics"}:
+                    status = 200
+                    body = snap
+                elif self.path in {"/ready", "/readyz"}:
+                    status = 200 if snap.get("ready") else 503
+                    body = snap
+                else:
+                    status = 404
+                    body = {"error": "not_found"}
+                data = json.dumps(body, separators=(",", ":")).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, fmt: str, *args: Any) -> None:
+                return
+
+        self._httpd = ThreadingHTTPServer((self.host, self.port), Handler)
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True, name="health-server")
+        self._thread.start()
+
+    def close(self) -> None:
+        if self._httpd is None:
+            return
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+
+class AzureLogAnalyticsClient:
+    def __init__(self, workspace_id: str, shared_key: str, log_type: str = "WsScraperEvents"):
+        self.workspace_id = normalize_env_scalar(workspace_id)
+        self.shared_key = normalize_env_scalar(shared_key)
+        self.log_type = normalize_env_scalar(log_type) or "WsScraperEvents"
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.workspace_id and self.shared_key)
+
+    def post_event(self, event: dict[str, Any]) -> tuple[bool, str]:
+        if not self.enabled:
+            return False, "disabled"
+        body = json.dumps([event], separators=(",", ":"))
+        rfc1123date = datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")
+        content_length = len(body)
+        string_to_hash = f"POST\n{content_length}\napplication/json\nx-ms-date:{rfc1123date}\n/api/logs"
+        decoded_key = base64.b64decode(self.shared_key)
+        encoded_hash = base64.b64encode(hmac.new(decoded_key, string_to_hash.encode("utf-8"), hashlib.sha256).digest())
+        signature = f"SharedKey {self.workspace_id}:{encoded_hash.decode('utf-8')}"
+        uri = f"https://{self.workspace_id}.ods.opinsights.azure.com/api/logs?api-version=2016-04-01"
+        headers = {
+            "content-type": "application/json",
+            "Authorization": signature,
+            "Log-Type": self.log_type,
+            "x-ms-date": rfc1123date,
+        }
+        resp = requests.post(uri, data=body, headers=headers, timeout=10)
+        return (resp.status_code in (200, 202), f"http_{resp.status_code}")
 
 
 def to_iso_utc(ts: float | int | None) -> str:
@@ -317,6 +444,7 @@ class CoinbaseWsDriver:
         self.last_message_monotonic = time.monotonic()
         self._dropped_lock = threading.Lock()
         self._dropped_counts: dict[str, int] = defaultdict(int)
+        self.reconnect_count = 0
         self._book_lock = threading.Lock()
         self._books: dict[str, dict[str, dict[float, float]]] = {
             product: {"bid": {}, "ask": {}} for product in self.products
@@ -556,6 +684,7 @@ class CoinbaseWsDriver:
         for wait_s in self.config.ws_reconnect_backoff_seconds:
             try:
                 self.connect()
+                self.reconnect_count += 1
                 return True
             except Exception:
                 time.sleep(wait_s)
@@ -591,6 +720,7 @@ class PolymarketWsDriver:
         self.last_message_monotonic = time.monotonic()
         self._dropped_lock = threading.Lock()
         self._dropped_counts: dict[str, int] = defaultdict(int)
+        self.reconnect_count = 0
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -881,14 +1011,15 @@ class PolymarketWsDriver:
                     min(backoff_idx, len(self.config.ws_reconnect_backoff_seconds) - 1)
                 ]
                 backoff_idx += 1
-                print(f"Polymarket WS reconnect in {wait_s:.1f}s ({type(exc).__name__}:{exc})")
+                self.reconnect_count += 1
+                log_event("ws_reconnect", worker="polymarket", wait_seconds=wait_s, reconnect_count=self.reconnect_count, reason=f"{type(exc).__name__}:{exc}")
                 await asyncio.sleep(wait_s)
 
     def _run_thread(self) -> None:
         try:
             asyncio.run(self._run_async())
         except Exception as exc:
-            print(f"Polymarket WS thread stopped: {type(exc).__name__}:{exc}")
+            log_event("worker_stopped", worker="polymarket", reason=f"{type(exc).__name__}:{exc}")
 
 
 class PolymarketMarketResolver:
@@ -1252,7 +1383,7 @@ class GraphAuthManager:
             message = str(flow.get("message") or "").strip()
 
         if message:
-            print(message)
+            log_event("graph_device_flow", message=message)
         result = self._app.acquire_token_by_device_flow(flow)
         token = str((result or {}).get("access_token") or "").strip()
         if not token:
@@ -1284,6 +1415,8 @@ class GraphUploader:
         self._uploaded_ok = 0
         self._failed_attempts = 0
         self._retry_attempts = 0
+        self._attempted_uploads = 0
+        self._last_success_unix = 0.0
 
     @staticmethod
     def _upload_url(onedrive_folder: str, date_str: str, filename: str) -> str:
@@ -1308,13 +1441,18 @@ class GraphUploader:
     def pending_count(self) -> int:
         return int(self._queue.qsize())
 
-    def stats_snapshot(self) -> dict[str, int]:
+    def stats_snapshot(self) -> dict[str, Any]:
         with self._stats_lock:
+            attempted = max(1, int(self._attempted_uploads))
+            success_rate = float(self._uploaded_ok) / float(attempted)
+            export_lag = 0.0 if self._last_success_unix <= 0 else max(0.0, time.time() - self._last_success_unix)
             return {
                 "uploaded_ok": int(self._uploaded_ok),
                 "failed_attempts": int(self._failed_attempts),
                 "retry_attempts": int(self._retry_attempts),
                 "pending_queue": int(self._queue.qsize()),
+                "success_rate": float(success_rate),
+                "export_lag_seconds": float(export_lag),
             }
 
     def _upload_once(self, job: UploadJob) -> tuple[bool, str]:
@@ -1365,20 +1503,17 @@ class GraphUploader:
                 if ok:
                     with self._stats_lock:
                         self._uploaded_ok += 1
-                    print(
-                        f"Graph upload success market={job.market_key} date={job.date_str} "
-                        f"file={job.filename} detail={detail}"
-                    )
+                        self._attempted_uploads += 1
+                        self._last_success_unix = time.time()
+                    log_event("graph_upload", market=job.market_key, lag=None, reconnect_count=None, queue_depth=self.pending_count(), upload_status="success", date=job.date_str, file=job.filename, detail=detail)
                     break
 
                 delay = float(self.backoff_seconds[min(attempt - 1, len(self.backoff_seconds) - 1)])
                 with self._stats_lock:
                     self._failed_attempts += 1
                     self._retry_attempts += 1
-                print(
-                    f"Graph upload retry market={job.market_key} date={job.date_str} file={job.filename} "
-                    f"attempt={attempt} retry_in_s={delay} reason={detail}"
-                )
+                    self._attempted_uploads += 1
+                log_event("graph_upload", market=job.market_key, lag=None, reconnect_count=None, queue_depth=self.pending_count(), upload_status="retry", date=job.date_str, file=job.filename, attempt=attempt, retry_in_s=delay, reason=detail)
                 # Retry forever while preserving FIFO order.
                 if self._stop_event.wait(delay):
                     break
@@ -1390,7 +1525,7 @@ class GraphUploader:
             return
         self._thread.join(timeout=max(0.0, float(wait_seconds)))
         if self._thread.is_alive():
-            print(f"Graph uploader still running with pending_queue={self.pending_count()}.")
+            log_event("graph_upload", market="all", lag=None, reconnect_count=None, queue_depth=self.pending_count(), upload_status="shutdown_pending")
 
 
 def infer_market_from_filename(filename: str) -> str:
@@ -1551,10 +1686,7 @@ class NdjsonZstdWriter:
         except Exception:
             pass
         size_bytes = self._current_size(entry)
-        print(
-            f"Writer close reason={reason} market={entry.market_key} date={entry.date_str} "
-            f"part={entry.part} size={size_bytes}B file={entry.path.name}"
-        )
+        log_event("writer_close", event_type_detail=reason, market=entry.market_key, queue_depth=None, upload_status="queued", lag=None, reconnect_count=None, file=entry.path.name, size_bytes=size_bytes, date=entry.date_str, part=entry.part)
         if size_bytes <= 0:
             return None
         job = UploadJob(
@@ -1713,6 +1845,20 @@ def build_collector_config(args: argparse.Namespace, runtime_cfg: RuntimeConfig)
     )
 
     graph_token_cache_path = APP_ROOT / ".graph_token_cache.bin"
+    health_host = normalize_env_scalar(os.getenv("HEALTH_HOST") or "0.0.0.0") or "0.0.0.0"
+    try:
+        health_port = int(normalize_env_scalar(os.getenv("HEALTH_PORT") or "8080"))
+    except ValueError:
+        health_port = 8080
+
+    azure_workspace = normalize_env_scalar(os.getenv("AZURE_LOG_ANALYTICS_WORKSPACE_ID"))
+    azure_shared_key = normalize_env_scalar(os.getenv("AZURE_LOG_ANALYTICS_SHARED_KEY"))
+    azure_log_type = normalize_env_scalar(os.getenv("AZURE_LOG_ANALYTICS_LOG_TYPE") or "WsScraperEvents")
+
+    alert_no_data_minutes = int(normalize_env_scalar(os.getenv("ALERT_NO_DATA_MINUTES") or "5") or "5")
+    alert_reconnect_storm_count = int(normalize_env_scalar(os.getenv("ALERT_RECONNECT_STORM_COUNT") or "8") or "8")
+    alert_queue_growth_minutes = int(normalize_env_scalar(os.getenv("ALERT_QUEUE_GROWTH_MINUTES") or "5") or "5")
+    alert_export_failure_threshold = float(normalize_env_scalar(os.getenv("ALERT_EXPORT_FAILURE_THRESHOLD") or "0.1") or "0.1")
 
     if graph_upload_enabled:
         missing: list[str] = []
@@ -1733,10 +1879,7 @@ def build_collector_config(args: argparse.Namespace, runtime_cfg: RuntimeConfig)
                 f"input={graph_scopes_raw},removed_reserved={removed_reserved_scopes}"
             )
         if removed_reserved_scopes:
-            print(
-                "Warning: GRAPH_SCOPES contains reserved scopes that were ignored "
-                f"(removed={removed_reserved_scopes}, effective={graph_scopes})."
-            )
+            log_event("config_warning", warning="reserved_graph_scopes_removed", removed=removed_reserved_scopes)
 
     return CollectorConfig(
         output_root=Path(args.output_root),
@@ -1762,23 +1905,40 @@ def build_collector_config(args: argparse.Namespace, runtime_cfg: RuntimeConfig)
         graph_upload_backoff_seconds=graph_upload_backoff_seconds,
         graph_upload_timeout_seconds=graph_upload_timeout_seconds,
         graph_token_cache_path=graph_token_cache_path,
+        health_host=health_host,
+        health_port=max(0, health_port),
+        azure_log_analytics_workspace_id=azure_workspace,
+        azure_log_analytics_shared_key=azure_shared_key,
+        azure_log_analytics_log_type=azure_log_type,
+        alert_no_data_minutes=max(1, alert_no_data_minutes),
+        alert_reconnect_storm_count=max(1, alert_reconnect_storm_count),
+        alert_queue_growth_minutes=max(1, alert_queue_growth_minutes),
+        alert_export_failure_threshold=max(0.0, min(1.0, alert_export_failure_threshold)),
     )
-
 
 def run(argv: Optional[list[str]] = None) -> None:
     load_dotenv(APP_ROOT / ".env", override=True)
-    args = parse_args(argv)
     runtime_cfg = RuntimeConfig.from_env()
+    args = parse_args(argv)
     cfg = build_collector_config(args, runtime_cfg)
 
-    print(
-        "Collector config "
-        f"(output_root={cfg.output_root}, duration_seconds={cfg.duration_seconds}, "
-        f"snapshot_interval_s={cfg.snapshot_interval_seconds}, log_every_s={cfg.log_every_seconds}, "
-        f"stale_timeout_s={cfg.ws_stale_timeout_seconds}, backoff={cfg.ws_reconnect_backoff_seconds}, "
-        f"size_target_mb_day={cfg.size_target_mb_per_day}, zstd_level={cfg.zstd_level}, "
-        f"graph_upload_enabled={cfg.graph_upload_enabled}, rotate_upload_threshold={cfg.rotate_upload_threshold_bytes}, "
-        f"graph_max_single_upload={cfg.graph_max_single_upload_bytes})."
+    log_event(
+        "collector_start",
+        market="all",
+        lag=0,
+        reconnect_count=0,
+        queue_depth=0,
+        upload_status="starting",
+        output_root=str(cfg.output_root),
+        duration_seconds=cfg.duration_seconds,
+    )
+
+    health = HealthServer(cfg.health_host, cfg.health_port)
+    health.start()
+    azure = AzureLogAnalyticsClient(
+        cfg.azure_log_analytics_workspace_id,
+        cfg.azure_log_analytics_shared_key,
+        cfg.azure_log_analytics_log_type,
     )
 
     event_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=cfg.queue_maxsize)
@@ -1792,8 +1952,7 @@ def run(argv: Optional[list[str]] = None) -> None:
             scopes=cfg.graph_scopes,
             cache_path=cfg.graph_token_cache_path,
         )
-        # Startup requirement: block for device code flow when no cached token is available.
-        auth_manager.acquire_access_token(allow_device_flow=True)
+        _ = auth_manager.acquire_access_token(allow_device_flow=True)
         uploader = GraphUploader(
             auth_manager=auth_manager,
             onedrive_folder=cfg.onedrive_folder,
@@ -1806,7 +1965,7 @@ def run(argv: Optional[list[str]] = None) -> None:
         for job in recovered_jobs:
             uploader.enqueue(job)
         if recovered_jobs:
-            print(f"Recovered {len(recovered_jobs)} pending files for Graph upload.")
+            log_event("graph_upload_recovered", market="all", lag=None, reconnect_count=0, queue_depth=uploader.pending_count(), upload_status="recovered", files=len(recovered_jobs))
 
     writer = NdjsonZstdWriter(
         output_root=cfg.output_root,
@@ -1829,46 +1988,45 @@ def run(argv: Optional[list[str]] = None) -> None:
     aggregator.update_polymarket_meta(metas)
     pm_driver.set_asset_bindings(bindings)
     if changed:
-        print(f"Polymarket subscription initialized with {len(bindings)} asset_ids.")
+        log_event("polymarket_subscription", market="all", lag=0, reconnect_count=pm_driver.reconnect_count, queue_depth=event_queue.qsize(), upload_status="n/a", asset_ids=len(bindings))
     for err in errors:
-        print(f"Resolver warning: {err}")
+        log_event("resolver_warning", market="all", lag=None, reconnect_count=0, queue_depth=event_queue.qsize(), upload_status="n/a", message=err)
 
     started = time.monotonic()
     next_resolve_ts = int(time.time())
     next_snapshot_ts = ts_floor(int(time.time()), cfg.snapshot_interval_seconds) + cfg.snapshot_interval_seconds
     next_log_ts = int(time.time()) + cfg.log_every_seconds
+    queue_history: list[int] = []
 
     try:
         while True:
             if cfg.duration_seconds > 0 and (time.monotonic() - started) >= cfg.duration_seconds:
-                print("Duration reached; stopping collector.")
+                log_event("collector_stop", market="all", lag=0, reconnect_count=0, queue_depth=event_queue.qsize(), upload_status="stopping", reason="duration_reached")
                 break
 
             now_ts = int(time.time())
+            queue_depth = int(event_queue.qsize())
+            queue_history.append(queue_depth)
+            max_points = max(1, cfg.alert_queue_growth_minutes * 20)
+            queue_history = queue_history[-max_points:]
 
             if now_ts >= next_resolve_ts:
                 changed, metas, bindings, errors = resolver.refresh(now_ts)
                 aggregator.update_polymarket_meta(metas)
                 if changed:
                     pm_driver.set_asset_bindings(bindings)
-                    print(
-                        "Polymarket rollover/subscription update "
-                        f"(asset_ids={len(bindings)}, markets={len(metas)})."
-                    )
+                    log_event("polymarket_subscription", market="all", lag=0, reconnect_count=pm_driver.reconnect_count, queue_depth=queue_depth, upload_status="n/a", asset_ids=len(bindings), markets=len(metas))
                 for err in errors:
-                    print(f"Resolver warning: {err}")
+                    log_event("resolver_warning", market="all", lag=None, reconnect_count=0, queue_depth=queue_depth, upload_status="n/a", message=err)
                 next_resolve_ts = now_ts + 1
 
             if cb_driver.seconds_since_message() > cfg.ws_stale_timeout_seconds:
-                print("Coinbase WS stale detected, reconnecting...")
-                if cb_driver.reconnect():
-                    print("Coinbase WS reconnected.")
-                else:
-                    print("Coinbase WS reconnect failed.")
+                ok = cb_driver.reconnect()
+                log_event("ws_reconnect", market="cb", lag=cb_driver.seconds_since_message(), reconnect_count=cb_driver.reconnect_count, queue_depth=queue_depth, upload_status="n/a", ok=ok)
 
             if pm_driver.seconds_since_message() > cfg.ws_stale_timeout_seconds:
-                print("Polymarket WS stale detected, requesting reconnect...")
                 pm_driver.request_reconnect()
+                log_event("ws_stale", market="pm", lag=pm_driver.seconds_since_message(), reconnect_count=pm_driver.reconnect_count, queue_depth=queue_depth, upload_status="n/a")
 
             drained = 0
             while drained < 20_000:
@@ -1899,23 +2057,42 @@ def run(argv: Optional[list[str]] = None) -> None:
                 for market_key in sorted(aggregator.states.keys()):
                     size_bytes = writer.market_day_size(market_key, current_date)
                     projected = projected_daily_bytes(size_bytes, elapsed)
-                    warn = " WARNING" if projected > target_bytes else ""
-                    print(
-                        f"size[{market_key}]={size_bytes}B projected_day={int(projected)}B "
-                        f"target={int(target_bytes)}B{warn}"
-                    )
-                for active in writer.active_file_stats():
-                    print(
-                        f"active_file[{active['market_key']}]={active['file']} size={active['size_bytes']}B "
-                        f"growth_bps={active['growth_bps']:.1f} age_s={active['age_seconds']:.1f}"
-                    )
-                if uploader is not None:
-                    us = uploader.stats_snapshot()
-                    print(
-                        "graph_uploader "
-                        f"pending={us['pending_queue']} uploaded_ok={us['uploaded_ok']} "
-                        f"failed_attempts={us['failed_attempts']} retries={us['retry_attempts']}"
-                    )
+                    log_event("size_projection", market=market_key, lag=0, reconnect_count=cb_driver.reconnect_count + pm_driver.reconnect_count, queue_depth=queue_depth, upload_status="n/a", size_bytes=size_bytes, projected_day_bytes=int(projected), target_bytes=int(target_bytes), over_target=projected > target_bytes)
+
+                upload_stats = uploader.stats_snapshot() if uploader is not None else {"pending_queue": 0, "uploaded_ok": 0, "failed_attempts": 0, "retry_attempts": 0, "success_rate": 1.0, "export_lag_seconds": 0}
+
+                health.update(WorkerHeartbeat(worker="coinbase", ws_freshness_seconds=cb_driver.seconds_since_message(), queue_backlog=queue_depth, blob_write_success_rate=1.0, export_lag_seconds=0.0, reconnect_count=cb_driver.reconnect_count, last_update_unix=time.time()))
+                health.update(WorkerHeartbeat(worker="polymarket", ws_freshness_seconds=pm_driver.seconds_since_message(), queue_backlog=queue_depth, blob_write_success_rate=1.0, export_lag_seconds=0.0, reconnect_count=pm_driver.reconnect_count, last_update_unix=time.time()))
+                health.update(WorkerHeartbeat(worker="uploader", ws_freshness_seconds=0.0, queue_backlog=int(upload_stats["pending_queue"]), blob_write_success_rate=float(upload_stats["success_rate"]), export_lag_seconds=float(upload_stats["export_lag_seconds"]), reconnect_count=0, last_update_unix=time.time()))
+
+                metric_event = {
+                    "event_type": "worker_metrics",
+                    "queue_depth": queue_depth,
+                    "reconnect_count": cb_driver.reconnect_count + pm_driver.reconnect_count,
+                    "upload_status": "ok",
+                    "upload_success_rate": upload_stats["success_rate"],
+                    "export_lag_seconds": upload_stats["export_lag_seconds"],
+                    "ws_freshness_coinbase": cb_driver.seconds_since_message(),
+                    "ws_freshness_polymarket": pm_driver.seconds_since_message(),
+                }
+                if azure.enabled:
+                    ok, detail = azure.post_event(metric_event)
+                    log_event("azure_log_analytics", market="all", lag=metric_event["export_lag_seconds"], reconnect_count=metric_event["reconnect_count"], queue_depth=queue_depth, upload_status="sent" if ok else "failed", detail=detail)
+
+                oldest_event = min((s.last_event_ts or now_ts) for s in aggregator.states.values())
+                no_data = (now_ts - oldest_event) >= (cfg.alert_no_data_minutes * 60)
+                reconnect_storm = (cb_driver.reconnect_count + pm_driver.reconnect_count) >= cfg.alert_reconnect_storm_count
+                queue_growth = len(queue_history) > 10 and queue_history[-1] > queue_history[0]
+                export_fail = float(upload_stats["success_rate"]) < (1.0 - cfg.alert_export_failure_threshold)
+                if no_data:
+                    log_event("alert", market="all", lag=now_ts - oldest_event, reconnect_count=cb_driver.reconnect_count + pm_driver.reconnect_count, queue_depth=queue_depth, upload_status="n/a", alert_name="no_data_for_n_minutes")
+                if reconnect_storm:
+                    log_event("alert", market="all", lag=0, reconnect_count=cb_driver.reconnect_count + pm_driver.reconnect_count, queue_depth=queue_depth, upload_status="n/a", alert_name="reconnect_storm")
+                if queue_growth:
+                    log_event("alert", market="all", lag=0, reconnect_count=cb_driver.reconnect_count + pm_driver.reconnect_count, queue_depth=queue_depth, upload_status="n/a", alert_name="sustained_queue_growth")
+                if export_fail:
+                    log_event("alert", market="all", lag=upload_stats["export_lag_seconds"], reconnect_count=cb_driver.reconnect_count + pm_driver.reconnect_count, queue_depth=queue_depth, upload_status="failed", alert_name="onedrive_export_failure_threshold")
+
                 next_log_ts = now_ts + cfg.log_every_seconds
 
             time.sleep(0.05)
@@ -1927,13 +2104,15 @@ def run(argv: Optional[list[str]] = None) -> None:
             writer.close()
             if uploader is not None:
                 uploader.close()
+            health.close()
+
 
 
 def main() -> None:
     try:
         run()
     except KeyboardInterrupt:
-        print("\nStopped by user.")
+        log_event("stopped_by_user")
 
 
 if __name__ == "__main__":
