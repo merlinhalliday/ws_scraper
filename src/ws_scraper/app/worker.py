@@ -1677,7 +1677,7 @@ def build_collector_config(args: argparse.Namespace, runtime_cfg: RuntimeConfig)
         queue_maxsize = 50_000
     queue_maxsize = max(1_000, queue_maxsize)
 
-    graph_upload_enabled = parse_env_bool("GRAPH_UPLOAD_ENABLED", True)
+    graph_upload_enabled = parse_env_bool("GRAPH_UPLOAD_ENABLED", False)
     graph_client_id = normalize_env_scalar(os.getenv("GRAPH_CLIENT_ID"))
     graph_authority = normalize_env_scalar(os.getenv("GRAPH_AUTHORITY"))
     graph_scopes_raw = parse_graph_scopes(os.getenv("GRAPH_SCOPES"))
@@ -1785,14 +1785,16 @@ def run(argv: Optional[list[str]] = None) -> None:
 
     uploader: Optional[GraphUploader] = None
     if cfg.graph_upload_enabled:
+        allow_device_flow = parse_env_bool("GRAPH_ALLOW_DEVICE_FLOW", False) and (
+            normalize_env_scalar(os.getenv("APP_ENV")).lower() == "local"
+        )
         auth_manager = GraphAuthManager(
             client_id=cfg.graph_client_id,
             authority=cfg.graph_authority,
             scopes=cfg.graph_scopes,
             cache_path=cfg.graph_token_cache_path,
         )
-        # Startup requirement: block for device code flow when no cached token is available.
-        auth_manager.acquire_access_token(allow_device_flow=True)
+        auth_manager.acquire_access_token(allow_device_flow=allow_device_flow)
         uploader = GraphUploader(
             auth_manager=auth_manager,
             onedrive_folder=cfg.onedrive_folder,

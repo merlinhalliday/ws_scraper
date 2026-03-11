@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import signal
@@ -39,12 +40,17 @@ def env_bool(name: str, default: bool) -> bool:
 class Shutdown:
     """Signal-aware shutdown helper for graceful worker exits."""
 
-    def __init__(self) -> None:
+    def __init__(self, logger: logging.Logger | None = None) -> None:
         self._event = threading.Event()
+        self._logger = logger
 
     def install(self) -> None:
         def _handler(signum: int, _frame: Any) -> None:
-            print(f"received_signal={signum}; requesting shutdown")
+            if self._logger is not None:
+                self._logger.info(
+                    "shutdown_requested",
+                    extra={"event": "shutdown_requested", "signal": signum},
+                )
             self._event.set()
 
         signal.signal(signal.SIGINT, _handler)

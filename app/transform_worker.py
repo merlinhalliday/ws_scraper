@@ -6,19 +6,19 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from ws_scraper.app.config import APP_ROOT
-from ws_scraper.pipeline.bronze import persist_batch
 from ws_scraper.pipeline.observability import WorkerTelemetry, log_event
 from ws_scraper.pipeline.runtime import PipelineSettings, env_int
+from ws_scraper.pipeline.silver import process_bronze_message
 from ws_scraper.pipeline.storage import BlobLedger, BlobStore, build_queue
 
 from app.worker_common import JsonCheckpoint, Shutdown
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Consume ingest batches and persist immutable Bronze blobs")
+    parser = argparse.ArgumentParser(description="Transform Bronze NDJSON blobs into typed Silver Parquet")
     parser.add_argument(
         "--checkpoint-path",
-        default=str(APP_ROOT / "outputs" / "worker_state" / "persist_checkpoint.json"),
+        default=str(APP_ROOT / "outputs" / "worker_state" / "transform_checkpoint.json"),
     )
     return parser.parse_args(argv)
 
@@ -28,72 +28,69 @@ def run(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     settings = PipelineSettings.from_env()
     settings.blob.validate()
-    telemetry = WorkerTelemetry("persist", settings.observability)
+    telemetry = WorkerTelemetry("transform", settings.observability)
     telemetry.start()
     shutdown = Shutdown(logger=telemetry.logger)
     shutdown.install()
 
-    ingest_queue = build_queue(settings.queues.ingest_queue_name, settings.queues, settings.identity)
     transform_queue = build_queue(settings.queues.transform_queue_name, settings.queues, settings.identity)
+    export_queue = build_queue(settings.queues.export_queue_name, settings.queues, settings.identity)
     blob_store = BlobStore(settings.blob, settings.identity)
     ledger = BlobLedger(blob_store, settings.blob.ledger_container, "ledger")
     checkpoint = JsonCheckpoint(Path(args.checkpoint_path))
 
-    fetch_batch = env_int("PERSIST_FETCH_BATCH", 8, minimum=1)
-    visibility_timeout = env_int("PERSIST_VISIBILITY_TIMEOUT_SECONDS", 180, minimum=30)
-    zstd_level = env_int("PERSIST_ZSTD_LEVEL", 3, minimum=1)
+    fetch_batch = env_int("TRANSFORM_FETCH_BATCH", 8, minimum=1)
+    visibility_timeout = env_int("TRANSFORM_VISIBILITY_TIMEOUT_SECONDS", 300, minimum=30)
 
     telemetry.set_ready(True)
     try:
         while not shutdown.requested():
             telemetry.heartbeat()
-            envelopes = ingest_queue.receive(
+            envelopes = transform_queue.receive(
                 max_messages=fetch_batch,
                 visibility_timeout=visibility_timeout,
                 wait_seconds=2,
             )
-            telemetry.metrics.set_gauge("persist_receive_batch_size", len(envelopes), {"worker": "persist"})
+            telemetry.metrics.set_gauge("transform_receive_batch_size", len(envelopes), {"worker": "transform"})
             if not envelopes:
                 continue
-
             for envelope in envelopes:
                 try:
-                    message = persist_batch(
+                    intent = process_bronze_message(
                         blob_store=blob_store,
                         raw_container=settings.blob.raw_container,
+                        silver_container=settings.blob.silver_container,
                         ledger=ledger,
-                        transform_queue=transform_queue,
-                        payload=envelope.body,
-                        zstd_level=zstd_level,
+                        export_queue=export_queue,
+                        bronze_message=envelope.body,
+                        include_hour_partition=settings.silver_partition_by_hour,
                         logger=telemetry.logger,
                         metrics=telemetry.metrics,
                     )
-                    ingest_queue.ack(envelope.receipt)
-                    if message is not None:
-                        checkpoint.save(
-                            {
-                                "last_batch_id": message.batch_id,
-                                "last_blob_path": message.bronze_blob_path,
-                                "last_row_count": message.row_count,
-                                "processed_at": message.produced_at,
-                            }
-                        )
+                    transform_queue.ack(envelope.receipt)
+                    checkpoint.save(
+                        {
+                            "last_export_id": intent.export_id,
+                            "last_silver_blob_path": intent.silver_blob_path,
+                            "processed_at": intent.produced_at,
+                        }
+                    )
                 except Exception as exc:
-                    telemetry.metrics.inc_counter("persist_failures_total", labels={"worker": "persist"})
+                    telemetry.metrics.inc_counter("transform_failures_total", labels={"worker": "transform"})
                     log_event(
                         telemetry.logger,
                         40,
-                        "persist_batch_failed",
+                        "transform_batch_failed",
                         error=str(exc),
                         batch_id=str(envelope.body.get("batch_id") or ""),
                     )
     except Exception as exc:
         telemetry.set_unhealthy(str(exc))
-        log_event(telemetry.logger, 40, "persist_worker_failed", error=str(exc))
+        log_event(telemetry.logger, 40, "transform_worker_failed", error=str(exc))
         raise
     finally:
-        ingest_queue.close()
         transform_queue.close()
+        export_queue.close()
         telemetry.close()
 
 

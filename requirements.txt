@@ -1,4 +1,4 @@
-requests
+requests>=2.31.0
 websockets
 coinbase-advanced-py
 python-dotenv
@@ -8,3 +8,5 @@ msal
 azure-storage-queue
 azure-storage-blob
 azure-servicebus
+azure-identity
+pyarrow
