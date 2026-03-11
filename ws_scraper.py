@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import queue
@@ -35,6 +36,13 @@ try:
     import msal
 except Exception:
     msal = None
+
+try:
+    from azure.storage.blob import BlobServiceClient
+    from azure.storage.queue import QueueClient
+except Exception:
+    BlobServiceClient = None
+    QueueClient = None
 
 
 COINBASE_PRODUCTS = ("BTC-USD", "ETH-USD")
@@ -85,6 +93,15 @@ class CollectorConfig:
     graph_upload_backoff_seconds: tuple[float, ...]
     graph_upload_timeout_seconds: float
     graph_token_cache_path: Path
+    azure_blob_enabled: bool
+    azure_blob_connection_string: str
+    azure_blob_container: str
+    azure_blob_dead_letter_container: str
+    azure_blob_prefix: str
+    azure_queue_name: str
+    export_job_enabled: bool
+    export_poison_attempts: int
+    export_state_path: Path
 
 
 @dataclass(frozen=True)
@@ -129,6 +146,26 @@ class UploadJob:
     market_key: str
     filename: str
     size_bytes: int
+
+
+@dataclass(frozen=True)
+class BlobExportMessage:
+    blob_name: str
+    date_str: str
+    market_key: str
+    filename: str
+    size_bytes: int
+    etag: str
+    content_md5_hex: str
+
+
+@dataclass
+class ExportStateRecord:
+    blob_etag: str
+    blob_md5: str
+    graph_status: str
+    graph_file_id: str
+    uploaded_at_utc: str
 
 
 def to_iso_utc(ts: float | int | None) -> str:
@@ -230,6 +267,40 @@ def normalize_onedrive_folder(value: Any) -> str:
     if not parts:
         return ""
     return "/" + "/".join(parts)
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def safe_json_load(path: Path, default: Any) -> Any:
+    try:
+        payload = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return default
+    except Exception:
+        return default
+    try:
+        return json.loads(payload)
+    except Exception:
+        return default
+
+
+def atomic_json_dump(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
 
 
 def is_date_dir_name(value: str) -> bool:
@@ -1263,27 +1334,112 @@ class GraphAuthManager:
         return token
 
 
-class GraphUploader:
-    def __init__(
-        self,
-        auth_manager: GraphAuthManager,
-        onedrive_folder: str,
-        timeout_seconds: float,
-        backoff_seconds: tuple[float, ...],
-        max_single_upload_bytes: int,
-    ):
+class CanonicalBlobStore:
+    def __init__(self, connection_string: str, container_name: str, prefix: str, queue_name: str):
+        if BlobServiceClient is None or QueueClient is None:
+            raise RuntimeError("missing_dependency:azure-storage-blob/azure-storage-queue")
+        self.container_name = normalize_env_scalar(container_name)
+        self.prefix = normalize_env_scalar(prefix).strip("/")
+        self._blob_service = BlobServiceClient.from_connection_string(connection_string)
+        self._blob_container = self._blob_service.get_container_client(self.container_name)
+        try:
+            self._blob_container.create_container()
+        except Exception:
+            pass
+        self._queue_client = QueueClient.from_connection_string(connection_string, queue_name)
+        try:
+            self._queue_client.create_queue()
+        except Exception:
+            pass
+
+    def _blob_name(self, job: UploadJob) -> str:
+        return "/".join([p for p in [self.prefix, job.date_str, job.market_key, job.filename] if p])
+
+    def persist_canonical(self, job: UploadJob) -> BlobExportMessage:
+        blob_name = self._blob_name(job)
+        content_md5_hex = sha256_file(job.local_path)
+        with job.local_path.open("rb") as fh:
+            result = self._blob_container.upload_blob(name=blob_name, data=fh, overwrite=True)
+        msg = BlobExportMessage(
+            blob_name=blob_name,
+            date_str=job.date_str,
+            market_key=job.market_key,
+            filename=job.filename,
+            size_bytes=int(job.size_bytes),
+            etag=str(getattr(result, "etag", "") or ""),
+            content_md5_hex=content_md5_hex,
+        )
+        self._queue_client.send_message(
+            json.dumps(
+                {
+                    "blob_name": msg.blob_name,
+                    "date_str": msg.date_str,
+                    "market_key": msg.market_key,
+                    "filename": msg.filename,
+                    "size_bytes": msg.size_bytes,
+                    "etag": msg.etag,
+                    "content_md5_hex": msg.content_md5_hex,
+                    "enqueued_at_utc": utc_now_iso(),
+                },
+                separators=(",", ":"),
+            )
+        )
+        return msg
+
+
+class ExportStateStore:
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+        data = safe_json_load(self.path, {})
+        self._state: dict[str, dict[str, Any]] = data if isinstance(data, dict) else {}
+
+    def _save_unlocked(self) -> None:
+        atomic_json_dump(self.path, self._state)
+
+    def is_uploaded(self, blob_name: str, etag: str, blob_md5: str) -> bool:
+        with self._lock:
+            row = self._state.get(blob_name) or {}
+            return row.get("blob_etag") == etag and row.get("blob_md5") == blob_md5 and row.get("graph_status") == "uploaded"
+
+    def mark_uploaded(self, blob_name: str, record: ExportStateRecord) -> None:
+        with self._lock:
+            self._state[blob_name] = {
+                "blob_etag": record.blob_etag,
+                "blob_md5": record.blob_md5,
+                "graph_status": record.graph_status,
+                "graph_file_id": record.graph_file_id,
+                "uploaded_at_utc": record.uploaded_at_utc,
+            }
+            self._save_unlocked()
+
+
+class GraphExportWorker:
+    def __init__(self, auth_manager: GraphAuthManager, onedrive_folder: str, timeout_seconds: float, backoff_seconds: tuple[float, ...], max_single_upload_bytes: int, connection_string: str, canonical_container: str, queue_name: str, dead_letter_container: str, poison_attempts: int, export_state: ExportStateStore):
+        if BlobServiceClient is None or QueueClient is None:
+            raise RuntimeError("missing_dependency:azure-storage-blob/azure-storage-queue")
         self.auth_manager = auth_manager
         self.onedrive_folder = normalize_onedrive_folder(onedrive_folder)
         self.timeout_seconds = max(1.0, float(timeout_seconds))
         self.backoff_seconds = tuple(backoff_seconds) if backoff_seconds else (2.0, 5.0, 15.0, 30.0, 60.0)
         self.max_single_upload_bytes = max(1_000_000, int(max_single_upload_bytes))
-        self._queue: queue.Queue[UploadJob] = queue.Queue(maxsize=100_000)
+        self.poison_attempts = max(2, int(poison_attempts))
+        self.export_state = export_state
+        self._blob_service = BlobServiceClient.from_connection_string(connection_string)
+        self._canonical_container = self._blob_service.get_container_client(canonical_container)
+        self._queue_client = QueueClient.from_connection_string(connection_string, queue_name)
+        self._dead_letter_container = self._blob_service.get_container_client(dead_letter_container)
+        try:
+            self._dead_letter_container.create_container()
+        except Exception:
+            pass
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._stats_lock = threading.Lock()
         self._uploaded_ok = 0
         self._failed_attempts = 0
         self._retry_attempts = 0
+        self._dead_lettered = 0
 
     @staticmethod
     def _upload_url(onedrive_folder: str, date_str: str, filename: str) -> str:
@@ -1293,104 +1449,94 @@ class GraphUploader:
         return f"{GRAPH_API_BASE}/me/drive/root:/{encoded}:/content"
 
     def start(self) -> None:
-        if self._thread is not None:
-            return
-        self._thread = threading.Thread(target=self._run, daemon=True, name="graph-upload-worker")
-        self._thread.start()
-
-    def enqueue(self, job: UploadJob) -> None:
-        try:
-            self._queue.put_nowait(job)
-        except queue.Full:
-            # Queue saturation should be highly unlikely; fallback to blocking put to avoid dropping files.
-            self._queue.put(job)
-
-    def pending_count(self) -> int:
-        return int(self._queue.qsize())
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, daemon=True, name="graph-export-worker")
+            self._thread.start()
 
     def stats_snapshot(self) -> dict[str, int]:
         with self._stats_lock:
-            return {
-                "uploaded_ok": int(self._uploaded_ok),
-                "failed_attempts": int(self._failed_attempts),
-                "retry_attempts": int(self._retry_attempts),
-                "pending_queue": int(self._queue.qsize()),
-            }
+            return {"uploaded_ok": self._uploaded_ok, "failed_attempts": self._failed_attempts, "retry_attempts": self._retry_attempts, "dead_lettered": self._dead_lettered}
 
-    def _upload_once(self, job: UploadJob) -> tuple[bool, str]:
-        if not job.local_path.exists():
-            return True, "missing_local_file"
-        if int(job.size_bytes) > self.max_single_upload_bytes:
-            return False, (
-                f"file_too_large_for_single_upload:size={job.size_bytes},"
-                f"max={self.max_single_upload_bytes}"
-            )
+    def _to_blob_message(self, content: str) -> BlobExportMessage:
+        payload = json.loads(content)
+        return BlobExportMessage(
+            blob_name=str(payload.get("blob_name") or ""),
+            date_str=str(payload.get("date_str") or ""),
+            market_key=str(payload.get("market_key") or ""),
+            filename=str(payload.get("filename") or ""),
+            size_bytes=int(payload.get("size_bytes") or 0),
+            etag=str(payload.get("etag") or ""),
+            content_md5_hex=str(payload.get("content_md5_hex") or ""),
+        )
+
+    def _graph_upload(self, msg: BlobExportMessage, payload: bytes) -> tuple[bool, str, str]:
+        if self.export_state.is_uploaded(msg.blob_name, msg.etag, msg.content_md5_hex):
+            return True, "idempotent_already_uploaded", ""
         token = self.auth_manager.acquire_access_token(allow_device_flow=False)
-        url = self._upload_url(self.onedrive_folder, job.date_str, job.filename)
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/octet-stream",
+            "If-None-Match": "*",
+            "client-request-id": f"{msg.content_md5_hex}:{msg.etag}",
         }
-        with job.local_path.open("rb") as fh:
-            resp = requests.put(url, headers=headers, data=fh, timeout=self.timeout_seconds)
+        url = self._upload_url(self.onedrive_folder, msg.date_str, msg.filename)
+        resp = requests.put(url, headers=headers, data=payload, timeout=self.timeout_seconds)
         if resp.status_code in (200, 201):
-            try:
-                job.local_path.unlink()
-            except FileNotFoundError:
-                pass
-            return True, f"http_{resp.status_code}"
+            body = resp.json() if resp.text else {}
+            return True, f"http_{resp.status_code}", str((body or {}).get("id") or "")
+        if resp.status_code == 412:
+            return True, "http_412_already_exists", ""
         text = str(resp.text or "").strip().replace("\n", " ")
-        if len(text) > 200:
-            text = text[:200] + "..."
-        return False, f"http_{resp.status_code}:{text}"
+        return False, f"http_{resp.status_code}:{text[:200]}", ""
+
+    def _dead_letter(self, raw_content: str, reason: str, dequeue_count: int) -> None:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        key = hashlib.sha256((raw_content + reason).encode("utf-8")).hexdigest()[:16]
+        payload = {"raw_message": raw_content, "reason": reason, "dequeue_count": dequeue_count, "dead_lettered_at_utc": utc_now_iso()}
+        self._dead_letter_container.upload_blob(name=f"dead-letter/{stamp}-{key}.json", data=json.dumps(payload), overwrite=True)
 
     def _run(self) -> None:
-        while not self._stop_event.is_set() or not self._queue.empty():
-            try:
-                job = self._queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-
-            attempt = 0
-            while True:
-                attempt += 1
-                ok = False
-                detail = ""
+        while not self._stop_event.is_set():
+            page = self._queue_client.receive_messages(messages_per_page=1, visibility_timeout=30)
+            got_any = False
+            for message in page:
+                got_any = True
+                raw_content = str(getattr(message, "content", "") or "")
+                dequeue_count = int(getattr(message, "dequeue_count", 1) or 1)
                 try:
-                    ok, detail = self._upload_once(job)
-                except Exception as exc:
-                    ok = False
-                    detail = f"exception:{exc}"
-
-                if ok:
+                    msg = self._to_blob_message(raw_content)
+                    if msg.size_bytes > self.max_single_upload_bytes:
+                        raise RuntimeError("file_too_large_for_single_upload")
+                    payload = self._canonical_container.download_blob(msg.blob_name).readall()
+                    if hashlib.sha256(payload).hexdigest() != msg.content_md5_hex:
+                        raise RuntimeError("blob_hash_mismatch")
+                    ok, detail, graph_file_id = self._graph_upload(msg, payload)
+                    if not ok:
+                        raise RuntimeError(detail)
+                    self.export_state.mark_uploaded(msg.blob_name, ExportStateRecord(msg.etag, msg.content_md5_hex, "uploaded", graph_file_id, utc_now_iso()))
+                    self._queue_client.delete_message(message.id, message.pop_receipt)
                     with self._stats_lock:
                         self._uploaded_ok += 1
-                    print(
-                        f"Graph upload success market={job.market_key} date={job.date_str} "
-                        f"file={job.filename} detail={detail}"
-                    )
-                    break
-
-                delay = float(self.backoff_seconds[min(attempt - 1, len(self.backoff_seconds) - 1)])
-                with self._stats_lock:
-                    self._failed_attempts += 1
-                    self._retry_attempts += 1
-                print(
-                    f"Graph upload retry market={job.market_key} date={job.date_str} file={job.filename} "
-                    f"attempt={attempt} retry_in_s={delay} reason={detail}"
-                )
-                # Retry forever while preserving FIFO order.
-                if self._stop_event.wait(delay):
-                    break
-            self._queue.task_done()
+                except Exception as exc:
+                    with self._stats_lock:
+                        self._failed_attempts += 1
+                    if dequeue_count >= self.poison_attempts:
+                        self._dead_letter(raw_content, str(exc), dequeue_count)
+                        self._queue_client.delete_message(message.id, message.pop_receipt)
+                        with self._stats_lock:
+                            self._dead_lettered += 1
+                    else:
+                        delay = int(self.backoff_seconds[min(dequeue_count - 1, len(self.backoff_seconds) - 1)])
+                        self._queue_client.update_message(message.id, message.pop_receipt, raw_content, visibility_timeout=max(1, delay))
+                        with self._stats_lock:
+                            self._retry_attempts += 1
+            if not got_any:
+                self._stop_event.wait(1.0)
 
     def close(self, wait_seconds: float = 2.0) -> None:
         self._stop_event.set()
-        if self._thread is None:
-            return
-        self._thread.join(timeout=max(0.0, float(wait_seconds)))
-        if self._thread.is_alive():
-            print(f"Graph uploader still running with pending_queue={self.pending_count()}.")
+        if self._thread is not None:
+            self._thread.join(timeout=max(0.0, float(wait_seconds)))
 
 
 def infer_market_from_filename(filename: str) -> str:
@@ -1643,6 +1789,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--duration-seconds", type=int, default=0, help="Run duration in seconds (0 = until Ctrl+C)")
     parser.add_argument("--snapshot-interval-seconds", type=int, default=1, help="Snapshot interval in seconds")
     parser.add_argument("--log-every-seconds", type=int, default=300, help="Progress/size log interval in seconds")
+    parser.add_argument("--export-only", action="store_true", help="Run only the Graph export worker from Azure queue")
     return parser.parse_args(argv)
 
 
@@ -1679,11 +1826,26 @@ def build_collector_config(args: argparse.Namespace, runtime_cfg: RuntimeConfig)
     queue_maxsize = max(1_000, queue_maxsize)
 
     graph_upload_enabled = parse_env_bool("GRAPH_UPLOAD_ENABLED", True)
+    export_job_enabled = parse_env_bool("EXPORT_JOB_ENABLED", graph_upload_enabled)
+    azure_blob_enabled = parse_env_bool("AZURE_BLOB_ENABLED", True)
     graph_client_id = normalize_env_scalar(os.getenv("GRAPH_CLIENT_ID"))
     graph_authority = normalize_env_scalar(os.getenv("GRAPH_AUTHORITY"))
     graph_scopes_raw = parse_graph_scopes(os.getenv("GRAPH_SCOPES"))
     graph_scopes, removed_reserved_scopes = sanitize_graph_scopes(graph_scopes_raw)
     onedrive_folder = normalize_onedrive_folder(os.getenv("ONEDRIVE_FOLDER"))
+    azure_blob_connection_string = normalize_env_scalar(os.getenv("AZURE_STORAGE_CONNECTION_STRING"))
+    azure_blob_container = normalize_env_scalar(os.getenv("AZURE_BLOB_CONTAINER") or "ws-canonical")
+    azure_blob_dead_letter_container = normalize_env_scalar(os.getenv("AZURE_BLOB_DEAD_LETTER_CONTAINER") or "ws-export-dead-letter")
+    azure_blob_prefix = normalize_env_scalar(os.getenv("AZURE_BLOB_PREFIX") or "ws-snapshots")
+    azure_queue_name = normalize_env_scalar(os.getenv("AZURE_EXPORT_QUEUE_NAME") or "ws-export-jobs")
+    export_state_path = APP_ROOT / "outputs" / "graph_export_state.json"
+
+    poison_raw = normalize_env_scalar(os.getenv("EXPORT_POISON_ATTEMPTS"))
+    try:
+        export_poison_attempts = int(poison_raw) if poison_raw else 5
+    except ValueError:
+        export_poison_attempts = 5
+    export_poison_attempts = max(2, export_poison_attempts)
 
     rotate_threshold_raw = normalize_env_scalar(os.getenv("ROTATE_UPLOAD_THRESHOLD_BYTES"))
     try:
@@ -1714,7 +1876,18 @@ def build_collector_config(args: argparse.Namespace, runtime_cfg: RuntimeConfig)
 
     graph_token_cache_path = APP_ROOT / ".graph_token_cache.bin"
 
-    if graph_upload_enabled:
+    if azure_blob_enabled:
+        missing_blob: list[str] = []
+        if not azure_blob_connection_string:
+            missing_blob.append("AZURE_STORAGE_CONNECTION_STRING")
+        if not azure_blob_container:
+            missing_blob.append("AZURE_BLOB_CONTAINER")
+        if not azure_queue_name:
+            missing_blob.append("AZURE_EXPORT_QUEUE_NAME")
+        if missing_blob:
+            raise RuntimeError(f"azure_blob_enabled_but_missing_env:{','.join(missing_blob)}")
+
+    if export_job_enabled:
         missing: list[str] = []
         if not graph_client_id:
             missing.append("GRAPH_CLIENT_ID")
@@ -1726,7 +1899,7 @@ def build_collector_config(args: argparse.Namespace, runtime_cfg: RuntimeConfig)
             missing.append("ONEDRIVE_FOLDER")
         if missing:
             joined = ",".join(missing)
-            raise RuntimeError(f"graph_upload_enabled_but_missing_env:{joined}")
+            raise RuntimeError(f"export_job_enabled_but_missing_env:{joined}")
         if not graph_scopes:
             raise RuntimeError(
                 "graph_scopes_invalid_after_sanitization:"
@@ -1762,6 +1935,15 @@ def build_collector_config(args: argparse.Namespace, runtime_cfg: RuntimeConfig)
         graph_upload_backoff_seconds=graph_upload_backoff_seconds,
         graph_upload_timeout_seconds=graph_upload_timeout_seconds,
         graph_token_cache_path=graph_token_cache_path,
+        azure_blob_enabled=azure_blob_enabled,
+        azure_blob_connection_string=azure_blob_connection_string,
+        azure_blob_container=azure_blob_container,
+        azure_blob_dead_letter_container=azure_blob_dead_letter_container,
+        azure_blob_prefix=azure_blob_prefix,
+        azure_queue_name=azure_queue_name,
+        export_job_enabled=export_job_enabled,
+        export_poison_attempts=export_poison_attempts,
+        export_state_path=export_state_path,
     )
 
 
@@ -1777,44 +1959,74 @@ def run(argv: Optional[list[str]] = None) -> None:
         f"snapshot_interval_s={cfg.snapshot_interval_seconds}, log_every_s={cfg.log_every_seconds}, "
         f"stale_timeout_s={cfg.ws_stale_timeout_seconds}, backoff={cfg.ws_reconnect_backoff_seconds}, "
         f"size_target_mb_day={cfg.size_target_mb_per_day}, zstd_level={cfg.zstd_level}, "
-        f"graph_upload_enabled={cfg.graph_upload_enabled}, rotate_upload_threshold={cfg.rotate_upload_threshold_bytes}, "
+        f"azure_blob_enabled={cfg.azure_blob_enabled}, export_job_enabled={cfg.export_job_enabled}, rotate_upload_threshold={cfg.rotate_upload_threshold_bytes}, "
         f"graph_max_single_upload={cfg.graph_max_single_upload_bytes})."
     )
 
     event_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=cfg.queue_maxsize)
     aggregator = WsSnapshotAggregator()
 
-    uploader: Optional[GraphUploader] = None
-    if cfg.graph_upload_enabled:
+    canonical_store: Optional[CanonicalBlobStore] = None
+    export_worker: Optional[GraphExportWorker] = None
+
+    if cfg.azure_blob_enabled:
+        canonical_store = CanonicalBlobStore(
+            connection_string=cfg.azure_blob_connection_string,
+            container_name=cfg.azure_blob_container,
+            prefix=cfg.azure_blob_prefix,
+            queue_name=cfg.azure_queue_name,
+        )
+
+    if cfg.export_job_enabled:
         auth_manager = GraphAuthManager(
             client_id=cfg.graph_client_id,
             authority=cfg.graph_authority,
             scopes=cfg.graph_scopes,
             cache_path=cfg.graph_token_cache_path,
         )
-        # Startup requirement: block for device code flow when no cached token is available.
         auth_manager.acquire_access_token(allow_device_flow=True)
-        uploader = GraphUploader(
+        export_worker = GraphExportWorker(
             auth_manager=auth_manager,
             onedrive_folder=cfg.onedrive_folder,
             timeout_seconds=cfg.graph_upload_timeout_seconds,
             backoff_seconds=cfg.graph_upload_backoff_seconds,
             max_single_upload_bytes=cfg.graph_max_single_upload_bytes,
+            connection_string=cfg.azure_blob_connection_string,
+            canonical_container=cfg.azure_blob_container,
+            queue_name=cfg.azure_queue_name,
+            dead_letter_container=cfg.azure_blob_dead_letter_container,
+            poison_attempts=cfg.export_poison_attempts,
+            export_state=ExportStateStore(cfg.export_state_path),
         )
-        uploader.start()
-        recovered_jobs = discover_pending_upload_jobs(cfg.output_root)
-        for job in recovered_jobs:
-            uploader.enqueue(job)
-        if recovered_jobs:
-            print(f"Recovered {len(recovered_jobs)} pending files for Graph upload.")
+        export_worker.start()
+
+    def on_file_closed(job: UploadJob) -> None:
+        if canonical_store is None:
+            return
+        canonical_store.persist_canonical(job)
 
     writer = NdjsonZstdWriter(
         output_root=cfg.output_root,
         zstd_level=cfg.zstd_level,
         rotate_upload_threshold_bytes=cfg.rotate_upload_threshold_bytes,
         max_single_upload_bytes=cfg.graph_max_single_upload_bytes,
-        on_file_closed=uploader.enqueue if uploader else None,
+        on_file_closed=on_file_closed if canonical_store else None,
     )
+
+    if args.export_only:
+        if export_worker is None:
+            raise RuntimeError("export_only_requires_EXPORT_JOB_ENABLED=1")
+        print("Running in export-only mode.")
+        started = time.monotonic()
+        try:
+            while True:
+                if cfg.duration_seconds > 0 and (time.monotonic() - started) >= cfg.duration_seconds:
+                    print("Duration reached; stopping export-only worker.")
+                    break
+                time.sleep(1.0)
+        finally:
+            export_worker.close()
+        return
 
     session = build_retrying_session()
     resolver = PolymarketMarketResolver(cfg, session)
@@ -1909,12 +2121,12 @@ def run(argv: Optional[list[str]] = None) -> None:
                         f"active_file[{active['market_key']}]={active['file']} size={active['size_bytes']}B "
                         f"growth_bps={active['growth_bps']:.1f} age_s={active['age_seconds']:.1f}"
                     )
-                if uploader is not None:
-                    us = uploader.stats_snapshot()
+                if export_worker is not None:
+                    us = export_worker.stats_snapshot()
                     print(
-                        "graph_uploader "
-                        f"pending={us['pending_queue']} uploaded_ok={us['uploaded_ok']} "
-                        f"failed_attempts={us['failed_attempts']} retries={us['retry_attempts']}"
+                        "graph_export_worker "
+                        f"uploaded_ok={us['uploaded_ok']} failed_attempts={us['failed_attempts']} "
+                        f"retries={us['retry_attempts']} dead_lettered={us['dead_lettered']}"
                     )
                 next_log_ts = now_ts + cfg.log_every_seconds
 
@@ -1925,8 +2137,8 @@ def run(argv: Optional[list[str]] = None) -> None:
         finally:
             pm_driver.close()
             writer.close()
-            if uploader is not None:
-                uploader.close()
+            if export_worker is not None:
+                export_worker.close()
 
 
 def main() -> None:

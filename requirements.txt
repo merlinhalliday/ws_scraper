@@ -5,3 +5,5 @@ python-dotenv
 urllib3
 zstandard
 msal
+azure-storage-blob
+azure-storage-queue
