@@ -37,19 +37,42 @@ except Exception:
     msal = None
 
 
-COINBASE_PRODUCTS = ("BTC-USD", "ETH-USD")
+COINBASE_PRODUCTS = (
+    "BTC-USD",
+    "ETH-USD",
+    "SOL-USD",
+    "XRP-USD",
+    "DOGE-USD",
+    "HYPE-USD",
+    "BNB-USD",
+)
 COINBASE_MARKET_KEY = {
     "BTC-USD": "cb-btcusd",
     "ETH-USD": "cb-ethusd",
+    "SOL-USD": "cb-solusd",
+    "XRP-USD": "cb-xrpusd",
+    "DOGE-USD": "cb-dogeusd",
+    "HYPE-USD": "cb-hypeusd",
+    "BNB-USD": "cb-bnbusd",
 }
-POLY_SYMBOLS = ("btc", "eth")
+POLY_SYMBOLS = ("btc", "eth", "sol", "xrp", "doge", "hype", "bnb")
 POLY_MARKET_KEY = {
     "btc": "pm-btc",
     "eth": "pm-eth",
+    "sol": "pm-sol",
+    "xrp": "pm-xrp",
+    "doge": "pm-doge",
+    "hype": "pm-hype",
+    "bnb": "pm-bnb",
 }
 POLY_SLUG_PREFIX = {
     "btc": "btc-updown-5m",
     "eth": "eth-updown-5m",
+    "sol": "sol-updown-5m",
+    "xrp": "xrp-updown-5m",
+    "doge": "doge-updown-5m",
+    "hype": "hype-updown-5m",
+    "bnb": "bnb-updown-5m",
 }
 POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 GRAPH_API_BASE = "https://graph.microsoft.com/v1.0"
@@ -1002,7 +1025,7 @@ class PolymarketMarketResolver:
             next_meta[meta.market_key] = meta
 
         next_bindings: dict[str, PolymarketTokenBinding] = {}
-        for market_key in (POLY_MARKET_KEY["btc"], POLY_MARKET_KEY["eth"]):
+        for market_key in (POLY_MARKET_KEY[symbol] for symbol in POLY_SYMBOLS):
             meta = next_meta.get(market_key)
             if meta is None:
                 continue
@@ -1050,10 +1073,14 @@ class SnapshotMarketState:
 class WsSnapshotAggregator:
     def __init__(self):
         self.states: dict[str, SnapshotMarketState] = {
-            "cb-btcusd": SnapshotMarketState(market_key="cb-btcusd", venue="coinbase"),
-            "cb-ethusd": SnapshotMarketState(market_key="cb-ethusd", venue="coinbase"),
-            "pm-btc": SnapshotMarketState(market_key="pm-btc", venue="polymarket"),
-            "pm-eth": SnapshotMarketState(market_key="pm-eth", venue="polymarket"),
+            **{
+                market_key: SnapshotMarketState(market_key=market_key, venue="coinbase")
+                for market_key in COINBASE_MARKET_KEY.values()
+            },
+            **{
+                market_key: SnapshotMarketState(market_key=market_key, venue="polymarket")
+                for market_key in POLY_MARKET_KEY.values()
+            },
         }
 
     def update_polymarket_meta(self, metas: dict[str, PolymarketMarketMeta]) -> None:

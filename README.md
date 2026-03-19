@@ -21,15 +21,13 @@ It uses the repo virtualenv directly:
 Boot order is:
 
 1. `network-online.target`
-2. `wg-quick@pia.service`
-3. `ws_scraper.service`
+2. `ws_scraper.service`
 
-That ordering ensures the PIA WireGuard tunnel is brought up before the scraper starts.
+The PIA WireGuard service is no longer part of the automatic boot sequence.
 
 ## Manage the services
 
 ```bash
-sudo systemctl status wg-quick@pia
 sudo systemctl status ws_scraper
 sudo systemctl status watchdog
 ```
@@ -37,7 +35,6 @@ sudo systemctl status watchdog
 Restart them manually if needed:
 
 ```bash
-sudo systemctl restart wg-quick@pia
 sudo systemctl restart ws_scraper
 sudo systemctl restart watchdog
 ```
@@ -45,7 +42,6 @@ sudo systemctl restart watchdog
 Enable them at boot:
 
 ```bash
-sudo systemctl enable wg-quick@pia
 sudo systemctl enable ws_scraper
 sudo systemctl enable watchdog
 ```
@@ -58,6 +54,6 @@ journalctl -u ws_scraper -f
 
 ## Notes
 
-- The PIA WireGuard config is expected at `/etc/wireguard/pia.conf`.
+- `wg-quick@pia.service` has been removed from automatic startup, so a reboot will not bring the VPN back up by itself.
 - The scraper runs as user `axolotl` with working directory `/home/axolotl/Documents/Projects/Data`.
 - `watchdog` is installed and configured to use `/dev/watchdog`.
