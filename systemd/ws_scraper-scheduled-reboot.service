@@ -1,0 +1,6 @@
+[Unit]
+Description=Safely stop ws_scraper and reboot the host
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ws_scraper_safe_reboot.sh

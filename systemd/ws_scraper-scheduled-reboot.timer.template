@@ -1,0 +1,11 @@
+[Unit]
+Description=Run safe host reboot on a fixed boot-relative schedule for ws_scraper
+
+[Timer]
+OnBootSec=__RESTART_SCHEDULE_S__
+OnUnitActiveSec=__RESTART_SCHEDULE_S__
+AccuracySec=1s
+Unit=ws_scraper-scheduled-reboot.service
+
+[Install]
+WantedBy=timers.target

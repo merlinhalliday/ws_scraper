@@ -108,6 +108,7 @@ class CollectorConfig:
     graph_upload_backoff_seconds: tuple[float, ...]
     graph_upload_timeout_seconds: float
     graph_token_cache_path: Path
+    restart_schedule_s: int
 
 
 @dataclass(frozen=True)
@@ -1740,6 +1741,13 @@ def build_collector_config(args: argparse.Namespace, runtime_cfg: RuntimeConfig)
     )
 
     graph_token_cache_path = APP_ROOT / ".graph_token_cache.bin"
+    restart_schedule_raw = normalize_env_scalar(os.getenv("RESTART_SCHEDULE_S"))
+    try:
+        restart_schedule_s = int(restart_schedule_raw) if restart_schedule_raw else 0
+    except ValueError:
+        raise RuntimeError(f"restart_schedule_s_invalid:{restart_schedule_raw!r}")
+    if restart_schedule_s < 0:
+        raise RuntimeError(f"restart_schedule_s_invalid:{restart_schedule_s}")
 
     if graph_upload_enabled:
         missing: list[str] = []
@@ -1789,6 +1797,7 @@ def build_collector_config(args: argparse.Namespace, runtime_cfg: RuntimeConfig)
         graph_upload_backoff_seconds=graph_upload_backoff_seconds,
         graph_upload_timeout_seconds=graph_upload_timeout_seconds,
         graph_token_cache_path=graph_token_cache_path,
+        restart_schedule_s=restart_schedule_s,
     )
 
 
@@ -1805,7 +1814,7 @@ def run(argv: Optional[list[str]] = None) -> None:
         f"stale_timeout_s={cfg.ws_stale_timeout_seconds}, backoff={cfg.ws_reconnect_backoff_seconds}, "
         f"size_target_mb_day={cfg.size_target_mb_per_day}, zstd_level={cfg.zstd_level}, "
         f"graph_upload_enabled={cfg.graph_upload_enabled}, rotate_upload_threshold={cfg.rotate_upload_threshold_bytes}, "
-        f"graph_max_single_upload={cfg.graph_max_single_upload_bytes})."
+        f"graph_max_single_upload={cfg.graph_max_single_upload_bytes}, restart_schedule_s={cfg.restart_schedule_s})."
     )
 
     event_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=cfg.queue_maxsize)
