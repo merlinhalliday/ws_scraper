@@ -9,7 +9,7 @@ import queue
 import re
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,12 +75,25 @@ POLY_SLUG_PREFIX = {
     "bnb": "bnb-updown-5m",
 }
 POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+POLY_TRADES_URL = "https://data-api.polymarket.com/trades"
 GRAPH_API_BASE = "https://graph.microsoft.com/v1.0"
 DATE_DIR_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 ROTATED_FILE_PATTERN = re.compile(
     r"^(?P<market>[a-z0-9-]+)__start_(?P<start>\d{8}T\d{6}Z)__part_(?P<part>\d{4})\.ndjson\.zst$"
 )
 GRAPH_RESERVED_SCOPES = frozenset({"offline_access", "openid", "profile"})
+PM_USER_TRADES_PREOPEN_SECONDS = 60
+PM_USER_TRADES_LIVE_SECONDS = 300
+PM_USER_TRADES_POLL_INTERVAL_SECONDS = 2.0
+PM_USER_TRADES_WINDOW_REFRESH_SECONDS = 5.0
+PM_USER_TRADES_LIVE_LIMIT = 200
+PM_USER_TRADES_BACKFILL_LIMIT = 500
+PM_USER_TRADES_BACKFILL_PAGE_CAP = 20
+PM_USER_TRADES_BACKFILL_MAX_OFFSET = 3000
+PM_USER_TRADES_BACKFILL_MARGIN_SECONDS = 15
+PM_USER_TRADES_QUEUE_MAXSIZE = 50_000
+PM_USER_TRADES_DEDUPE_MAX_KEYS_PER_CONDITION = 50_000
+PM_USER_TRADES_AUDIT_COOLDOWN_SECONDS = 60.0
 
 
 @dataclass(frozen=True)
@@ -109,6 +122,7 @@ class CollectorConfig:
     graph_upload_timeout_seconds: float
     graph_token_cache_path: Path
     restart_schedule_s: int
+    pm_user_trades_enabled: bool
 
 
 @dataclass(frozen=True)
@@ -131,6 +145,45 @@ class PolymarketTokenBinding:
     bucket_start_ts: int
     condition_id: str
     asset_id: str
+
+
+@dataclass
+class PolymarketUserTradeOutcomeState:
+    market_key: str
+    symbol: str
+    base_market_key: str
+    slug: str
+    condition_id: str
+    bucket_start_ts: int
+    window_open_ts: int
+    window_close_ts: int
+    outcome: str
+    outcome_index: int
+    asset_id: str
+    capture_ok: bool = True
+    capture_reason: str = ""
+    suspected_gap: bool = False
+    api_error_count: int = 0
+    pages_fetched: int = 0
+    rows_written: int = 0
+    rows_deduped: int = 0
+    queue_overflow_count: int = 0
+    poll_lag_ms_max: int = 0
+    backfill_applied: bool = False
+    last_audit_reason: str = ""
+    last_audit_monotonic: float = 0.0
+
+
+@dataclass
+class PolymarketUserTradeWindowState:
+    symbol: str
+    base_market_key: str
+    slug: str
+    condition_id: str
+    bucket_start_ts: int
+    window_open_ts: int
+    window_close_ts: int
+    outcomes: dict[str, PolymarketUserTradeOutcomeState]
 
 
 @dataclass
@@ -296,6 +349,29 @@ def normalize_listish(value: Any) -> list[Any]:
 
 def market_slug(symbol: str, bucket_start_ts: int) -> str:
     return f"{POLY_SLUG_PREFIX[symbol]}-{bucket_start_ts}"
+
+
+def user_trade_market_key(symbol: str, outcome: str) -> str:
+    return f"pm-usertrade-{str(symbol).strip().lower()}-{str(outcome).strip().lower()}"
+
+
+def normalize_polymarket_outcome(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"yes", "up"}:
+        return "up"
+    if raw in {"no", "down"}:
+        return "down"
+    return raw
+
+
+def append_capture_reason(existing: str, new_reason: str) -> str:
+    candidate = str(new_reason or "").strip()
+    if not candidate:
+        return str(existing or "").strip()
+    parts = [part for part in str(existing or "").split(";") if part]
+    if candidate not in parts:
+        parts.append(candidate)
+    return ";".join(parts[:3])
 
 
 def projected_daily_bytes(bytes_so_far: int, elapsed_seconds: float) -> float:
@@ -921,6 +997,7 @@ class PolymarketMarketResolver:
         self.session = session
         self.current_meta: dict[str, PolymarketMarketMeta] = {}
         self.current_bindings: dict[str, PolymarketTokenBinding] = {}
+        self._meta_cache: dict[str, PolymarketMarketMeta] = {}
 
     @staticmethod
     def _pick_yes_no_assets(token_ids: list[str], outcomes: list[str]) -> tuple[str, str]:
@@ -945,6 +1022,9 @@ class PolymarketMarketResolver:
 
     def _fetch_market_meta(self, symbol: str, bucket_start_ts: int) -> tuple[Optional[PolymarketMarketMeta], str]:
         slug = market_slug(symbol, bucket_start_ts)
+        cached = self._meta_cache.get(slug)
+        if cached is not None:
+            return cached, ""
         try:
             resp = self.session.get(
                 self.config.gamma_markets_url,
@@ -976,8 +1056,7 @@ class PolymarketMarketResolver:
         if not yes_asset or not no_asset:
             return None, f"gamma_missing_yes_no_assets:{symbol}:{slug}"
 
-        return (
-            PolymarketMarketMeta(
+        meta = PolymarketMarketMeta(
                 symbol=symbol,
                 market_key=POLY_MARKET_KEY[symbol],
                 slug=slug,
@@ -985,9 +1064,9 @@ class PolymarketMarketResolver:
                 condition_id=condition_id,
                 yes_asset_id=yes_asset,
                 no_asset_id=no_asset,
-            ),
-            "",
         )
+        self._meta_cache[slug] = meta
+        return meta, ""
 
     @staticmethod
     def _meta_to_bindings(meta: PolymarketMarketMeta) -> list[PolymarketTokenBinding]:
@@ -1037,6 +1116,704 @@ class PolymarketMarketResolver:
         self.current_meta = next_meta
         self.current_bindings = next_bindings
         return changed, dict(self.current_meta), dict(self.current_bindings), errors
+
+    def resolve_condition_windows(
+        self,
+        now_ts: int,
+        bucket_offsets: tuple[int, ...],
+    ) -> tuple[dict[str, PolymarketMarketMeta], list[str]]:
+        resolved: dict[str, PolymarketMarketMeta] = {}
+        errors: list[str] = []
+        seen: set[tuple[str, int]] = set()
+        base_now = int(now_ts)
+
+        for symbol in POLY_SYMBOLS:
+            for offset in bucket_offsets:
+                bucket_start_ts = ts_floor(base_now + int(offset), 300)
+                cache_key = (symbol, bucket_start_ts)
+                if cache_key in seen:
+                    continue
+                seen.add(cache_key)
+                meta, err = self._fetch_market_meta(symbol, bucket_start_ts)
+                if meta is None:
+                    if err:
+                        errors.append(err)
+                    continue
+                if not meta.condition_id:
+                    errors.append(f"gamma_missing_condition_id:{meta.slug}")
+                    continue
+                resolved[meta.condition_id] = meta
+
+        return resolved, errors
+
+
+def build_polymarket_user_trade_window(meta: PolymarketMarketMeta) -> PolymarketUserTradeWindowState:
+    window_open_ts = int(meta.bucket_start_ts) - PM_USER_TRADES_PREOPEN_SECONDS
+    window_close_ts = int(meta.bucket_start_ts) + PM_USER_TRADES_LIVE_SECONDS
+    base_market_key = POLY_MARKET_KEY[meta.symbol]
+    outcomes = {
+        "up": PolymarketUserTradeOutcomeState(
+            market_key=user_trade_market_key(meta.symbol, "up"),
+            symbol=meta.symbol,
+            base_market_key=base_market_key,
+            slug=meta.slug,
+            condition_id=meta.condition_id,
+            bucket_start_ts=int(meta.bucket_start_ts),
+            window_open_ts=window_open_ts,
+            window_close_ts=window_close_ts,
+            outcome="up",
+            outcome_index=0,
+            asset_id=meta.yes_asset_id,
+        ),
+        "down": PolymarketUserTradeOutcomeState(
+            market_key=user_trade_market_key(meta.symbol, "down"),
+            symbol=meta.symbol,
+            base_market_key=base_market_key,
+            slug=meta.slug,
+            condition_id=meta.condition_id,
+            bucket_start_ts=int(meta.bucket_start_ts),
+            window_open_ts=window_open_ts,
+            window_close_ts=window_close_ts,
+            outcome="down",
+            outcome_index=1,
+            asset_id=meta.no_asset_id,
+        ),
+    }
+    return PolymarketUserTradeWindowState(
+        symbol=meta.symbol,
+        base_market_key=base_market_key,
+        slug=meta.slug,
+        condition_id=meta.condition_id,
+        bucket_start_ts=int(meta.bucket_start_ts),
+        window_open_ts=window_open_ts,
+        window_close_ts=window_close_ts,
+        outcomes=outcomes,
+    )
+
+
+class PolymarketUserTradeCollector:
+    def __init__(
+        self,
+        config: CollectorConfig,
+        output_root: Path,
+        zstd_level: int,
+        rotate_upload_threshold_bytes: int,
+        max_single_upload_bytes: int,
+        on_file_closed: Optional[Callable[[UploadJob], None]],
+    ):
+        self.config = config
+        self.output_root = Path(output_root)
+        self._session = build_retrying_session()
+        self._resolver = PolymarketMarketResolver(config, build_retrying_session())
+        self._writer = NdjsonZstdWriter(
+            output_root=self.output_root,
+            zstd_level=zstd_level,
+            rotate_upload_threshold_bytes=rotate_upload_threshold_bytes,
+            max_single_upload_bytes=max_single_upload_bytes,
+            on_file_closed=on_file_closed,
+        )
+        self._backfill_queue: queue.Queue[Optional[tuple[str, str]]] = queue.Queue()
+        self._row_queue: queue.Queue[Optional[dict[str, Any]]] = queue.Queue(maxsize=PM_USER_TRADES_QUEUE_MAXSIZE)
+        self._stop_event = threading.Event()
+        self._writer_thread: Optional[threading.Thread] = None
+        self._poll_thread: Optional[threading.Thread] = None
+        self._backfill_thread: Optional[threading.Thread] = None
+        self._state_lock = threading.Lock()
+        self._windows: dict[str, PolymarketUserTradeWindowState] = {}
+        self._active_condition_ids: set[str] = set()
+        self._backfill_pending_condition_ids: set[str] = set()
+        self._dedupe_by_condition: dict[str, OrderedDict[str, None]] = {}
+        self._stats_lock = threading.Lock()
+        self._rows_enqueued = 0
+        self._audit_rows_enqueued = 0
+        self._rows_dropped = 0
+
+    def start(self) -> None:
+        if self._writer_thread is not None or self._poll_thread is not None or self._backfill_thread is not None:
+            return
+        self._writer_thread = threading.Thread(target=self._run_writer, daemon=True, name="pm-usertrade-writer")
+        self._backfill_thread = threading.Thread(
+            target=self._run_backfill_worker,
+            daemon=True,
+            name="pm-usertrade-backfill",
+        )
+        self._poll_thread = threading.Thread(target=self._run_poller, daemon=True, name="pm-usertrade-poller")
+        self._writer_thread.start()
+        self._backfill_thread.start()
+        self._poll_thread.start()
+
+    def stats_snapshot(self) -> dict[str, int]:
+        with self._state_lock:
+            windows = list(self._windows.values())
+            active_condition_ids = set(self._active_condition_ids)
+        degraded_outcomes = 0
+        tracked_outcomes = 0
+        for window in windows:
+            for outcome_state in window.outcomes.values():
+                tracked_outcomes += 1
+                if not outcome_state.capture_ok:
+                    degraded_outcomes += 1
+        with self._stats_lock:
+            return {
+                "active_conditions": int(len(active_condition_ids)),
+                "tracked_windows": int(len(windows)),
+                "tracked_outcomes": int(tracked_outcomes),
+                "degraded_outcomes": int(degraded_outcomes),
+                "pending_rows": int(self._row_queue.qsize()),
+                "rows_enqueued": int(self._rows_enqueued),
+                "audit_rows_enqueued": int(self._audit_rows_enqueued),
+                "rows_dropped": int(self._rows_dropped),
+            }
+
+    def close(self, wait_seconds: float = 5.0) -> None:
+        self._stop_event.set()
+        if self._poll_thread is not None:
+            self._poll_thread.join(timeout=max(0.0, float(wait_seconds)))
+            if self._poll_thread.is_alive():
+                print("Polymarket user-trade poller still running during shutdown.")
+        try:
+            self._backfill_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._backfill_thread is not None:
+            self._backfill_thread.join(timeout=max(0.0, float(wait_seconds)))
+            if self._backfill_thread.is_alive():
+                print("Polymarket user-trade backfill worker still running during shutdown.")
+        deadline = time.monotonic() + max(0.1, float(wait_seconds))
+        while True:
+            try:
+                self._row_queue.put(None, timeout=0.2)
+                break
+            except queue.Full:
+                if time.monotonic() >= deadline:
+                    print("Polymarket user-trade writer queue full during shutdown; forcing writer exit.")
+                    break
+        if self._writer_thread is not None:
+            self._writer_thread.join(timeout=max(0.0, float(wait_seconds)))
+            if self._writer_thread.is_alive():
+                print("Polymarket user-trade writer still running during shutdown.")
+
+    def _run_writer(self) -> None:
+        try:
+            while True:
+                item = self._row_queue.get()
+                try:
+                    if item is None:
+                        break
+                    self._writer.write_row(item)
+                except Exception as exc:
+                    print(f"Polymarket user-trade writer error: {type(exc).__name__}:{exc}")
+                finally:
+                    self._row_queue.task_done()
+        finally:
+            self._writer.close()
+
+    def _run_backfill_worker(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                item = self._backfill_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                if item is None:
+                    break
+                condition_id, collection_mode = item
+                self._backfill_condition(condition_id, collection_mode)
+            except Exception as exc:
+                print(f"Polymarket user-trade backfill worker error: {type(exc).__name__}:{exc}")
+            finally:
+                self._backfill_queue.task_done()
+
+    def _run_poller(self) -> None:
+        try:
+            now_ts = int(time.time())
+            self._refresh_windows(now_ts, include_previous=True, backfill_mode="startup_backfill")
+            self._finalize_closed_windows(now_ts)
+
+            next_refresh_monotonic = time.monotonic() + PM_USER_TRADES_WINDOW_REFRESH_SECONDS
+            next_poll_monotonic = time.monotonic()
+
+            while not self._stop_event.is_set():
+                now_monotonic = time.monotonic()
+                now_ts = int(time.time())
+
+                if now_monotonic >= next_refresh_monotonic:
+                    self._refresh_windows(now_ts, include_previous=False, backfill_mode="overlap_backfill")
+                    self._finalize_closed_windows(now_ts)
+                    next_refresh_monotonic = now_monotonic + PM_USER_TRADES_WINDOW_REFRESH_SECONDS
+
+                poll_lag_ms = max(0, int((now_monotonic - next_poll_monotonic) * 1000.0))
+                self._poll_active_windows(now_ts, poll_lag_ms)
+                self._finalize_closed_windows(int(time.time()))
+
+                next_poll_monotonic += PM_USER_TRADES_POLL_INTERVAL_SECONDS
+                sleep_seconds = next_poll_monotonic - time.monotonic()
+                if sleep_seconds <= 0:
+                    next_poll_monotonic = time.monotonic()
+                    continue
+                if self._stop_event.wait(sleep_seconds):
+                    break
+        except Exception as exc:
+            print(f"Polymarket user-trade collector stopped: {type(exc).__name__}:{exc}")
+
+    def _refresh_windows(self, now_ts: int, include_previous: bool, backfill_mode: str) -> None:
+        offsets = (0, 300)
+        if include_previous:
+            offsets = (-300, 0, 300)
+        resolved, errors = self._resolver.resolve_condition_windows(now_ts, offsets)
+        for err in errors:
+            print(f"Polymarket user-trade resolver warning: {err}")
+
+        new_condition_ids: list[str] = []
+        current_bucket_start = ts_floor(int(now_ts), 300)
+        active_condition_ids = {
+            condition_id
+            for condition_id, meta in resolved.items()
+            if int(meta.bucket_start_ts) >= current_bucket_start
+        }
+
+        with self._state_lock:
+            for condition_id, meta in resolved.items():
+                if condition_id in self._windows:
+                    continue
+                self._windows[condition_id] = build_polymarket_user_trade_window(meta)
+                self._dedupe_by_condition.setdefault(condition_id, OrderedDict())
+                new_condition_ids.append(condition_id)
+            self._active_condition_ids = set(active_condition_ids)
+
+        if new_condition_ids:
+            print(
+                "Polymarket user-trade backfill "
+                f"mode={backfill_mode} windows={len(new_condition_ids)}."
+            )
+            for condition_id in new_condition_ids:
+                self._enqueue_backfill(condition_id, backfill_mode)
+
+    def _enqueue_backfill(self, condition_id: str, collection_mode: str) -> None:
+        condition = str(condition_id or "").strip()
+        if not condition:
+            return
+        with self._state_lock:
+            if condition in self._backfill_pending_condition_ids:
+                return
+            self._backfill_pending_condition_ids.add(condition)
+        self._backfill_queue.put((condition, collection_mode))
+
+    def _poll_active_windows(self, now_ts: int, poll_lag_ms: int) -> None:
+        with self._state_lock:
+            condition_ids = list(self._active_condition_ids)
+        for condition_id in condition_ids:
+            if self._stop_event.is_set():
+                break
+            if poll_lag_ms > int(PM_USER_TRADES_POLL_INTERVAL_SECONDS * 1000.0):
+                self._mark_condition_degraded(
+                    condition_id,
+                    "poll_lag",
+                    suspected_gap=True,
+                    poll_lag_ms=poll_lag_ms,
+                    emit_audit=True,
+                )
+            self._fetch_and_process_page(
+                condition_id=condition_id,
+                limit=PM_USER_TRADES_LIVE_LIMIT,
+                offset=0,
+                collection_mode="live_poll",
+            )
+
+    def _backfill_condition(self, condition_id: str, collection_mode: str) -> None:
+        try:
+            window = self._window_for_condition(condition_id)
+            if window is None:
+                return
+            for outcome_state in window.outcomes.values():
+                outcome_state.backfill_applied = True
+
+            reached_boundary = False
+            offset = 0
+            page_count = 0
+            earliest_needed_ts = int(window.window_open_ts) - PM_USER_TRADES_BACKFILL_MARGIN_SECONDS
+
+            while (
+                not self._stop_event.is_set()
+                and page_count < PM_USER_TRADES_BACKFILL_PAGE_CAP
+                and offset <= PM_USER_TRADES_BACKFILL_MAX_OFFSET
+            ):
+                page_count += 1
+                trades, ok = self._fetch_and_process_page(
+                    condition_id=condition_id,
+                    limit=PM_USER_TRADES_BACKFILL_LIMIT,
+                    offset=offset,
+                    collection_mode=collection_mode,
+                )
+                if not ok:
+                    return
+                if not trades:
+                    reached_boundary = True
+                    break
+
+                oldest_trade_ts: Optional[float] = None
+                for trade in trades:
+                    trade_ts = coerce_float(trade.get("timestamp"))
+                    if trade_ts is None:
+                        continue
+                    if oldest_trade_ts is None or trade_ts < oldest_trade_ts:
+                        oldest_trade_ts = trade_ts
+
+                if oldest_trade_ts is not None and oldest_trade_ts <= float(earliest_needed_ts):
+                    reached_boundary = True
+                    break
+                if len(trades) < PM_USER_TRADES_BACKFILL_LIMIT:
+                    reached_boundary = True
+                    break
+                offset += PM_USER_TRADES_BACKFILL_LIMIT
+
+            if not reached_boundary:
+                self._mark_condition_degraded(condition_id, "page_cap_hit", suspected_gap=True, emit_audit=True)
+        finally:
+            with self._state_lock:
+                self._backfill_pending_condition_ids.discard(str(condition_id or "").strip())
+            self._finalize_closed_windows(int(time.time()))
+
+    def _fetch_and_process_page(
+        self,
+        condition_id: str,
+        limit: int,
+        offset: int,
+        collection_mode: str,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        try:
+            response = self._session.get(
+                POLY_TRADES_URL,
+                params={
+                    "market": condition_id,
+                    "limit": int(limit),
+                    "offset": int(offset),
+                    "takerOnly": "false",
+                },
+                timeout=self.config.http_timeout_seconds,
+            )
+        except Exception as exc:
+            self._mark_condition_degraded(
+                condition_id,
+                f"api_error:{type(exc).__name__}",
+                suspected_gap=True,
+                api_error_increment=1,
+                emit_audit=True,
+            )
+            print(f"Polymarket user-trade fetch failed condition={condition_id}: {type(exc).__name__}:{exc}")
+            return [], False
+
+        if not response.ok:
+            self._mark_condition_degraded(
+                condition_id,
+                f"api_http_{response.status_code}",
+                suspected_gap=True,
+                api_error_increment=1,
+                emit_audit=True,
+            )
+            text = str(response.text or "").strip().replace("\n", " ")
+            if len(text) > 200:
+                text = text[:200] + "..."
+            print(
+                "Polymarket user-trade fetch failed "
+                f"condition={condition_id} status={response.status_code} detail={text}"
+            )
+            return [], False
+
+        try:
+            payload = response.json()
+        except Exception as exc:
+            self._mark_condition_degraded(
+                condition_id,
+                f"api_bad_json:{type(exc).__name__}",
+                suspected_gap=True,
+                api_error_increment=1,
+                emit_audit=True,
+            )
+            print(f"Polymarket user-trade json decode failed condition={condition_id}: {type(exc).__name__}:{exc}")
+            return [], False
+
+        if isinstance(payload, dict):
+            raw_rows = payload.get("data")
+        else:
+            raw_rows = payload
+        if not isinstance(raw_rows, list):
+            self._mark_condition_degraded(
+                condition_id,
+                "api_bad_payload",
+                suspected_gap=True,
+                api_error_increment=1,
+                emit_audit=True,
+            )
+            return [], False
+
+        trades = [row for row in raw_rows if isinstance(row, dict)]
+        window = self._window_for_condition(condition_id)
+        if window is None:
+            return trades, True
+        for outcome_state in window.outcomes.values():
+            outcome_state.pages_fetched += 1
+
+        observed_at_ts = time.time()
+        ordered = sorted(
+            trades,
+            key=lambda row: (
+                coerce_float(row.get("timestamp")) or 0.0,
+                str(row.get("transactionHash") or ""),
+                str(row.get("proxyWallet") or ""),
+            ),
+        )
+        for trade in ordered:
+            self._process_trade(trade, observed_at_ts, collection_mode)
+        return trades, True
+
+    def _process_trade(self, trade: dict[str, Any], observed_at_ts: float, collection_mode: str) -> None:
+        condition_id = str(trade.get("conditionId") or trade.get("condition_id") or "").strip()
+        if not condition_id:
+            return
+        window = self._window_for_condition(condition_id)
+        if window is None:
+            return
+
+        trade_ts = coerce_float(trade.get("timestamp"))
+        if trade_ts is None:
+            return
+        if float(trade_ts) < float(window.window_open_ts) or float(trade_ts) > float(window.window_close_ts):
+            return
+
+        outcome_state = self._outcome_state_for_trade(window, trade)
+        if outcome_state is None:
+            return
+
+        dedupe_key = self._trade_dedupe_key(condition_id, trade)
+        if self._seen_trade(condition_id, dedupe_key):
+            outcome_state.rows_deduped += 1
+            return
+
+        row = self._build_trade_row(outcome_state, trade, observed_at_ts, collection_mode)
+        if self._enqueue_row(row, is_audit=False):
+            outcome_state.rows_written += 1
+            return
+
+        outcome_state.queue_overflow_count += 1
+        self._mark_outcome_degraded(outcome_state, "queue_overflow", suspected_gap=True)
+        self._emit_audit_row(outcome_state, observed_at_ts, force=False)
+
+    def _window_for_condition(self, condition_id: str) -> Optional[PolymarketUserTradeWindowState]:
+        with self._state_lock:
+            return self._windows.get(str(condition_id or "").strip())
+
+    def _outcome_state_for_trade(
+        self,
+        window: PolymarketUserTradeWindowState,
+        trade: dict[str, Any],
+    ) -> Optional[PolymarketUserTradeOutcomeState]:
+        outcome = normalize_polymarket_outcome(trade.get("outcome"))
+        if outcome in window.outcomes:
+            return window.outcomes[outcome]
+
+        asset_id = str(trade.get("asset") or "").strip()
+        if asset_id:
+            for outcome_state in window.outcomes.values():
+                if outcome_state.asset_id == asset_id:
+                    return outcome_state
+
+        outcome_index = coerce_int(trade.get("outcomeIndex"))
+        if outcome_index is not None:
+            if int(outcome_index) == 0:
+                return window.outcomes.get("up")
+            if int(outcome_index) == 1:
+                return window.outcomes.get("down")
+        return None
+
+    def _trade_dedupe_key(self, condition_id: str, trade: dict[str, Any]) -> str:
+        parts = [
+            str(condition_id or "").strip(),
+            str(trade.get("proxyWallet") or "").strip(),
+            str(trade.get("asset") or "").strip(),
+            str(trade.get("timestamp") or "").strip(),
+            str(trade.get("price") or "").strip(),
+            str(trade.get("size") or "").strip(),
+            str(trade.get("side") or "").strip().lower(),
+            str(trade.get("transactionHash") or "").strip(),
+        ]
+        return "|".join(parts)
+
+    def _seen_trade(self, condition_id: str, dedupe_key: str) -> bool:
+        seen = self._dedupe_by_condition.setdefault(str(condition_id), OrderedDict())
+        if dedupe_key in seen:
+            seen.move_to_end(dedupe_key)
+            return True
+        seen[dedupe_key] = None
+        while len(seen) > PM_USER_TRADES_DEDUPE_MAX_KEYS_PER_CONDITION:
+            seen.popitem(last=False)
+        return False
+
+    def _mark_condition_degraded(
+        self,
+        condition_id: str,
+        reason: str,
+        suspected_gap: bool,
+        api_error_increment: int = 0,
+        poll_lag_ms: int = 0,
+        emit_audit: bool = False,
+    ) -> None:
+        window = self._window_for_condition(condition_id)
+        if window is None:
+            return
+        now_ts = time.time()
+        for outcome_state in window.outcomes.values():
+            if api_error_increment > 0:
+                outcome_state.api_error_count += int(api_error_increment)
+            if poll_lag_ms > 0:
+                outcome_state.poll_lag_ms_max = max(outcome_state.poll_lag_ms_max, int(poll_lag_ms))
+            self._mark_outcome_degraded(outcome_state, reason, suspected_gap=suspected_gap)
+            if emit_audit:
+                self._emit_audit_row(outcome_state, now_ts, force=False)
+
+    @staticmethod
+    def _mark_outcome_degraded(
+        outcome_state: PolymarketUserTradeOutcomeState,
+        reason: str,
+        suspected_gap: bool,
+    ) -> None:
+        outcome_state.capture_ok = False
+        outcome_state.capture_reason = append_capture_reason(outcome_state.capture_reason, reason)
+        if suspected_gap:
+            outcome_state.suspected_gap = True
+
+    def _build_trade_row(
+        self,
+        outcome_state: PolymarketUserTradeOutcomeState,
+        trade: dict[str, Any],
+        observed_at_ts: float,
+        collection_mode: str,
+    ) -> dict[str, Any]:
+        trade_ts = coerce_float(trade.get("timestamp")) or 0.0
+        trade_ts_iso = to_iso_utc(trade_ts)
+        price = coerce_float(trade.get("price"))
+        size = coerce_float(trade.get("size"))
+        notional = float(price) * float(size) if price is not None and size is not None else ""
+        return {
+            "ts_utc": trade_ts_iso,
+            "row_type": "trade",
+            "market_key": outcome_state.market_key,
+            "base_market_key": outcome_state.base_market_key,
+            "symbol": outcome_state.symbol,
+            "venue": "polymarket",
+            "condition_id": outcome_state.condition_id,
+            "slug": outcome_state.slug,
+            "outcome": outcome_state.outcome,
+            "outcome_index": int(outcome_state.outcome_index),
+            "window_t0_utc": to_iso_utc(outcome_state.bucket_start_ts),
+            "window_open_utc": to_iso_utc(outcome_state.window_open_ts),
+            "window_close_utc": to_iso_utc(outcome_state.window_close_ts),
+            "relative_t_ms": int(round((float(trade_ts) - float(outcome_state.bucket_start_ts)) * 1000.0)),
+            "window_phase": "preopen" if float(trade_ts) < float(outcome_state.bucket_start_ts) else "live",
+            "trade_ts_utc": trade_ts_iso,
+            "trade_ts_unix": float(trade_ts),
+            "observed_at_utc": to_iso_utc(observed_at_ts),
+            "collection_mode": collection_mode,
+            "proxy_wallet": str(trade.get("proxyWallet") or "").strip(),
+            "name": str(trade.get("name") or "").strip(),
+            "pseudonym": str(trade.get("pseudonym") or "").strip(),
+            "side": str(trade.get("side") or "").strip().lower(),
+            "asset_id": str(trade.get("asset") or "").strip(),
+            "price": float(price) if price is not None else "",
+            "size": float(size) if size is not None else "",
+            "notional_usdc": notional,
+            "transaction_hash": str(trade.get("transactionHash") or "").strip(),
+            "capture_ok": bool(outcome_state.capture_ok),
+            "capture_reason": str(outcome_state.capture_reason or ""),
+        }
+
+    def _build_audit_row(
+        self,
+        outcome_state: PolymarketUserTradeOutcomeState,
+        emitted_at_ts: float,
+        final_window_audit: bool,
+    ) -> dict[str, Any]:
+        ts_value = float(outcome_state.window_close_ts) if final_window_audit else max(
+            float(outcome_state.window_open_ts),
+            min(float(emitted_at_ts), float(outcome_state.window_close_ts)),
+        )
+        return {
+            "ts_utc": to_iso_utc(ts_value),
+            "row_type": "audit",
+            "market_key": outcome_state.market_key,
+            "base_market_key": outcome_state.base_market_key,
+            "symbol": outcome_state.symbol,
+            "condition_id": outcome_state.condition_id,
+            "slug": outcome_state.slug,
+            "outcome": outcome_state.outcome,
+            "window_t0_utc": to_iso_utc(outcome_state.bucket_start_ts),
+            "window_open_utc": to_iso_utc(outcome_state.window_open_ts),
+            "window_close_utc": to_iso_utc(outcome_state.window_close_ts),
+            "capture_ok": bool(outcome_state.capture_ok),
+            "capture_reason": str(outcome_state.capture_reason or ""),
+            "suspected_gap": bool(outcome_state.suspected_gap),
+            "api_error_count": int(outcome_state.api_error_count),
+            "pages_fetched": int(outcome_state.pages_fetched),
+            "rows_written": int(outcome_state.rows_written),
+            "rows_deduped": int(outcome_state.rows_deduped),
+            "queue_overflow_count": int(outcome_state.queue_overflow_count),
+            "poll_lag_ms_max": int(outcome_state.poll_lag_ms_max),
+            "backfill_applied": bool(outcome_state.backfill_applied),
+        }
+
+    def _emit_audit_row(
+        self,
+        outcome_state: PolymarketUserTradeOutcomeState,
+        emitted_at_ts: float,
+        force: bool,
+    ) -> None:
+        reason_key = str(outcome_state.capture_reason or "")
+        now_monotonic = time.monotonic()
+        if not force:
+            if (
+                reason_key == outcome_state.last_audit_reason
+                and (now_monotonic - float(outcome_state.last_audit_monotonic)) < PM_USER_TRADES_AUDIT_COOLDOWN_SECONDS
+            ):
+                return
+        row = self._build_audit_row(outcome_state, emitted_at_ts, final_window_audit=force)
+        if self._enqueue_row(row, is_audit=True):
+            outcome_state.last_audit_reason = reason_key
+            outcome_state.last_audit_monotonic = now_monotonic
+
+    def _enqueue_row(self, row: dict[str, Any], is_audit: bool) -> bool:
+        try:
+            self._row_queue.put_nowait(row)
+        except queue.Full:
+            with self._stats_lock:
+                self._rows_dropped += 1
+            return False
+
+        with self._stats_lock:
+            self._rows_enqueued += 1
+            if is_audit:
+                self._audit_rows_enqueued += 1
+        return True
+
+    def _finalize_closed_windows(self, now_ts: int) -> None:
+        with self._state_lock:
+            active_condition_ids = set(self._active_condition_ids)
+            backfill_pending_condition_ids = set(self._backfill_pending_condition_ids)
+            closed_items = [
+                (condition_id, window)
+                for condition_id, window in self._windows.items()
+                if (
+                    int(now_ts) >= int(window.window_close_ts)
+                    and condition_id not in active_condition_ids
+                    and condition_id not in backfill_pending_condition_ids
+                )
+            ]
+            for condition_id, _window in closed_items:
+                self._windows.pop(condition_id, None)
+                self._dedupe_by_condition.pop(condition_id, None)
+
+        for _condition_id, window in closed_items:
+            for outcome_state in window.outcomes.values():
+                self._emit_audit_row(outcome_state, float(window.window_close_ts), force=True)
 
 
 @dataclass
@@ -1749,6 +2526,8 @@ def build_collector_config(args: argparse.Namespace, runtime_cfg: RuntimeConfig)
     if restart_schedule_s < 0:
         raise RuntimeError(f"restart_schedule_s_invalid:{restart_schedule_s}")
 
+    pm_user_trades_enabled = parse_env_bool("PM_USER_TRADES_ENABLED", False)
+
     if graph_upload_enabled:
         missing: list[str] = []
         if not graph_client_id:
@@ -1798,6 +2577,7 @@ def build_collector_config(args: argparse.Namespace, runtime_cfg: RuntimeConfig)
         graph_upload_timeout_seconds=graph_upload_timeout_seconds,
         graph_token_cache_path=graph_token_cache_path,
         restart_schedule_s=restart_schedule_s,
+        pm_user_trades_enabled=pm_user_trades_enabled,
     )
 
 
@@ -1814,7 +2594,8 @@ def run(argv: Optional[list[str]] = None) -> None:
         f"stale_timeout_s={cfg.ws_stale_timeout_seconds}, backoff={cfg.ws_reconnect_backoff_seconds}, "
         f"size_target_mb_day={cfg.size_target_mb_per_day}, zstd_level={cfg.zstd_level}, "
         f"graph_upload_enabled={cfg.graph_upload_enabled}, rotate_upload_threshold={cfg.rotate_upload_threshold_bytes}, "
-        f"graph_max_single_upload={cfg.graph_max_single_upload_bytes}, restart_schedule_s={cfg.restart_schedule_s})."
+        f"graph_max_single_upload={cfg.graph_max_single_upload_bytes}, restart_schedule_s={cfg.restart_schedule_s}, "
+        f"pm_user_trades_enabled={cfg.pm_user_trades_enabled})."
     )
 
     event_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=cfg.queue_maxsize)
@@ -1851,6 +2632,18 @@ def run(argv: Optional[list[str]] = None) -> None:
         max_single_upload_bytes=cfg.graph_max_single_upload_bytes,
         on_file_closed=uploader.enqueue if uploader else None,
     )
+    user_trade_collector: Optional[PolymarketUserTradeCollector] = None
+    if cfg.pm_user_trades_enabled:
+        user_trade_collector = PolymarketUserTradeCollector(
+            config=cfg,
+            output_root=cfg.output_root,
+            zstd_level=cfg.zstd_level,
+            rotate_upload_threshold_bytes=cfg.rotate_upload_threshold_bytes,
+            max_single_upload_bytes=cfg.graph_max_single_upload_bytes,
+            on_file_closed=uploader.enqueue if uploader else None,
+        )
+        user_trade_collector.start()
+        print("Polymarket user-trade collector started.")
 
     session = build_retrying_session()
     resolver = PolymarketMarketResolver(cfg, session)
@@ -1952,6 +2745,15 @@ def run(argv: Optional[list[str]] = None) -> None:
                         f"pending={us['pending_queue']} uploaded_ok={us['uploaded_ok']} "
                         f"failed_attempts={us['failed_attempts']} retries={us['retry_attempts']}"
                     )
+                if user_trade_collector is not None:
+                    uts = user_trade_collector.stats_snapshot()
+                    print(
+                        "pm_user_trades "
+                        f"active_conditions={uts['active_conditions']} tracked_windows={uts['tracked_windows']} "
+                        f"tracked_outcomes={uts['tracked_outcomes']} degraded_outcomes={uts['degraded_outcomes']} "
+                        f"pending_rows={uts['pending_rows']} rows_enqueued={uts['rows_enqueued']} "
+                        f"audit_rows={uts['audit_rows_enqueued']} dropped_rows={uts['rows_dropped']}"
+                    )
                 next_log_ts = now_ts + cfg.log_every_seconds
 
             time.sleep(0.05)
@@ -1960,6 +2762,8 @@ def run(argv: Optional[list[str]] = None) -> None:
             cb_driver.close()
         finally:
             pm_driver.close()
+            if user_trade_collector is not None:
+                user_trade_collector.close()
             writer.close()
             if uploader is not None:
                 uploader.close()
