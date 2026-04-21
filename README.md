@@ -17,6 +17,8 @@ Create `.env` with the live credentials and runtime settings. The scheduled rebo
 ```bash
 RESTART_SCHEDULE_S=21600
 PM_USER_TRADES_ENABLED=true
+PM_USER_TRADES_REPAIR_ENABLED=true
+PM_USER_TRADES_FINAL_CATCHUP_ENABLED=true
 ```
 
 Set `RESTART_SCHEDULE_S=0` to disable scheduled reboots.
@@ -127,6 +129,13 @@ When `PM_USER_TRADES_ENABLED=true`, the scraper also writes a second dataset in 
 
 This v1 dataset captures public user-attributed **Polymarket trades** only. It does **not** capture public user-attributed order placements or cancellations, because those are not available for all users from the public endpoints.
 
+The collector stays inside the existing `ws_scraper.service` process and uses:
+
+- a poller thread for live watermark catch-up and final catch-up
+- a backfill worker for startup/overlap backfills
+- a repair worker for degraded closed windows only
+- the same NDJSON writer, file rotation, and Graph upload path as the main dataset
+
 The new files use the same:
 
 - NDJSON + Zstandard format
@@ -168,7 +177,7 @@ Trade rows include:
 - public user fields such as `proxy_wallet`, `name`, `pseudonym`
 - trade fields such as `price`, `size`, `transaction_hash`, `side`
 - market-window fields such as `window_t0_utc`, `window_open_utc`, `window_close_utc`, `relative_t_ms`, `window_phase`
-- `collection_mode` showing whether the row came from `live_poll`, `startup_backfill`, or `overlap_backfill`
+- `collection_mode` showing whether the row came from `live_poll`, `startup_backfill`, `overlap_backfill`, `final_catchup`, or `repair`
 - `capture_ok` and `capture_reason`
 
 Audit rows include:
@@ -177,15 +186,46 @@ Audit rows include:
 - the same market/window identity fields
 - `capture_ok`, `capture_reason`, `suspected_gap`
 - `api_error_count`, `pages_fetched`, `rows_written`, `rows_deduped`, `queue_overflow_count`, `poll_lag_ms_max`, `backfill_applied`
+- per-mode page counters: `live_pages_fetched`, `startup_backfill_pages_fetched`, `overlap_backfill_pages_fetched`, `final_catchup_pages_fetched`, `repair_pages_fetched`
+- repair/finality fields: `repair_wallets_attempted`, `repair_wallets_with_new_rows`, `final_catchup_applied`, `repair_applied`, `repair_pending`
+- coverage/debug fields: `max_offset_reached`, `oldest_trade_ts_seen`, `newest_trade_ts_seen`, `resolver_returned_slug`
 
 `capture_ok=false` means the bounded collector could not be fully confident that the window was complete. In practice this is where you should trust the data less during training or analysis.
+
+Important `capture_reason` values now include:
+
+- `live_page_cap_hit`
+- `backfill_page_cap_hit`
+- `backfill_offset_cap_hit`
+- `repair_page_cap_hit`
 
 ### Restart behavior
 
 - The scheduled reboot units are unchanged.
 - The user-trade dataset runs under the same `ws_scraper.service` entrypoint, but with its own internal poller thread, queue, dedupe state, and writer.
 - On startup after a reboot, the collector backfills the previous/current/next 5-minute windows before continuing live polling.
-- If the bounded backfill cannot fully reach the requested window coverage within API/hardware limits, the final audit row marks that window with `capture_ok=false` rather than silently pretending it is complete.
+- Before a closed window is finally audited, the collector can run one last bounded `final_catchup` pass.
+- If a closed window is still degraded and the collector already observed participating wallets, the repair worker queries `/trades?market=<condition>&user=<wallet>` for those known wallets before final audit.
+- If bounded live/backfill/repair coverage still cannot reach the requested window coverage within API/hardware limits, the final audit row marks that window with `capture_ok=false` rather than silently pretending it is complete.
+
+### User-trade tuning knobs
+
+These settings are read from `.env` at runtime:
+
+```bash
+PM_USER_TRADES_API_MAX_LIMIT=500
+PM_USER_TRADES_API_MAX_OFFSET=1000
+PM_USER_TRADES_LIVE_LIMIT=500
+PM_USER_TRADES_BACKFILL_LIMIT=500
+PM_USER_TRADES_LIVE_PAGE_CAP=3
+PM_USER_TRADES_BACKFILL_PAGE_CAP=20
+PM_USER_TRADES_REPAIR_ENABLED=true
+PM_USER_TRADES_REPAIR_WALLET_CAP=250
+PM_USER_TRADES_REPAIR_PAGE_CAP=3
+PM_USER_TRADES_FINAL_CATCHUP_ENABLED=true
+```
+
+These are intentionally conservative because they run inside the same long-lived scraper process and are still subject to Polymarket Data API rate limits.
 
 ### Verify both datasets are flowing
 

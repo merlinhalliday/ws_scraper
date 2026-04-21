@@ -10,21 +10,29 @@ import re
 import threading
 import time
 from collections import OrderedDict, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import quote
 
 import requests
-import websockets
-from coinbase.websocket import WSClient
 from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from polygale.config import APP_ROOT, RuntimeConfig
 from polygale.utils import coerce_float, coerce_int, parse_coinbase_heartbeat_time, parse_iso8601
+
+try:
+    import websockets
+except Exception:
+    websockets = None
+
+try:
+    from coinbase.websocket import WSClient
+except Exception:
+    WSClient = None
 
 try:
     import zstandard as zstd
@@ -86,10 +94,6 @@ PM_USER_TRADES_PREOPEN_SECONDS = 60
 PM_USER_TRADES_LIVE_SECONDS = 300
 PM_USER_TRADES_POLL_INTERVAL_SECONDS = 2.0
 PM_USER_TRADES_WINDOW_REFRESH_SECONDS = 5.0
-PM_USER_TRADES_LIVE_LIMIT = 200
-PM_USER_TRADES_BACKFILL_LIMIT = 500
-PM_USER_TRADES_BACKFILL_PAGE_CAP = 20
-PM_USER_TRADES_BACKFILL_MAX_OFFSET = 3000
 PM_USER_TRADES_BACKFILL_MARGIN_SECONDS = 15
 PM_USER_TRADES_QUEUE_MAXSIZE = 50_000
 PM_USER_TRADES_DEDUPE_MAX_KEYS_PER_CONDITION = 50_000
@@ -123,6 +127,16 @@ class CollectorConfig:
     graph_token_cache_path: Path
     restart_schedule_s: int
     pm_user_trades_enabled: bool
+    pm_user_trades_api_max_limit: int
+    pm_user_trades_api_max_offset: int
+    pm_user_trades_live_limit: int
+    pm_user_trades_backfill_limit: int
+    pm_user_trades_live_page_cap: int
+    pm_user_trades_backfill_page_cap: int
+    pm_user_trades_repair_enabled: bool
+    pm_user_trades_repair_wallet_cap: int
+    pm_user_trades_repair_page_cap: int
+    pm_user_trades_final_catchup_enabled: bool
 
 
 @dataclass(frozen=True)
@@ -130,6 +144,7 @@ class PolymarketMarketMeta:
     symbol: str
     market_key: str
     slug: str
+    resolver_returned_slug: str
     bucket_start_ts: int
     condition_id: str
     yes_asset_id: str
@@ -179,11 +194,29 @@ class PolymarketUserTradeWindowState:
     symbol: str
     base_market_key: str
     slug: str
+    resolver_returned_slug: str
     condition_id: str
     bucket_start_ts: int
     window_open_ts: int
     window_close_ts: int
     outcomes: dict[str, PolymarketUserTradeOutcomeState]
+    newest_trade_ts_seen: float | None = None
+    newest_trade_dedupe_key: str = ""
+    oldest_trade_ts_seen: float | None = None
+    max_offset_reached: int = 0
+    observed_wallets: OrderedDict[str, None] = field(default_factory=OrderedDict)
+    repair_pending: bool = False
+    repair_requested: bool = False
+    repair_completed: bool = False
+    final_catchup_applied: bool = False
+    repair_applied: bool = False
+    live_pages_fetched: int = 0
+    startup_backfill_pages_fetched: int = 0
+    overlap_backfill_pages_fetched: int = 0
+    final_catchup_pages_fetched: int = 0
+    repair_pages_fetched: int = 0
+    repair_wallets_attempted: int = 0
+    repair_wallets_with_new_rows: int = 0
 
 
 @dataclass
@@ -634,6 +667,8 @@ class CoinbaseWsDriver:
 
     def connect(self) -> None:
         self.close()
+        if WSClient is None:
+            raise RuntimeError("coinbase_websocket_client_unavailable")
         self.ws = WSClient(on_message=self._on_message, retry=False, verbose=False)
         self.ws.open()
         self.ws.heartbeats()
@@ -925,6 +960,8 @@ class PolymarketWsDriver:
             self._subscribed_assets.update(to_subscribe)
 
     async def _run_async(self) -> None:
+        if websockets is None:
+            raise RuntimeError("polymarket_websocket_client_unavailable")
         self._loop = asyncio.get_running_loop()
         backoff_idx = 0
         while not self._stop_event.is_set():
@@ -1043,6 +1080,9 @@ class PolymarketMarketResolver:
             return None, f"gamma_market_not_found:{slug}"
 
         market = payload[0] if isinstance(payload[0], dict) else {}
+        returned_slug = str(market.get("slug") or "").strip()
+        if returned_slug != slug:
+            return None, f"gamma_slug_mismatch:{slug}:{returned_slug or 'missing'}"
         condition_id = str(market.get("conditionId") or market.get("condition_id") or "")
         token_ids_raw = normalize_listish(market.get("clobTokenIds") or market.get("clob_token_ids") or [])
         token_ids = [str(x).strip() for x in token_ids_raw if str(x).strip()]
@@ -1060,6 +1100,7 @@ class PolymarketMarketResolver:
                 symbol=symbol,
                 market_key=POLY_MARKET_KEY[symbol],
                 slug=slug,
+                resolver_returned_slug=returned_slug,
                 bucket_start_ts=bucket_start_ts,
                 condition_id=condition_id,
                 yes_asset_id=yes_asset,
@@ -1183,6 +1224,7 @@ def build_polymarket_user_trade_window(meta: PolymarketMarketMeta) -> Polymarket
         symbol=meta.symbol,
         base_market_key=base_market_key,
         slug=meta.slug,
+        resolver_returned_slug=meta.resolver_returned_slug,
         condition_id=meta.condition_id,
         bucket_start_ts=int(meta.bucket_start_ts),
         window_open_ts=window_open_ts,
@@ -1213,11 +1255,13 @@ class PolymarketUserTradeCollector:
             on_file_closed=on_file_closed,
         )
         self._backfill_queue: queue.Queue[Optional[tuple[str, str]]] = queue.Queue()
+        self._repair_queue: queue.Queue[Optional[str]] = queue.Queue()
         self._row_queue: queue.Queue[Optional[dict[str, Any]]] = queue.Queue(maxsize=PM_USER_TRADES_QUEUE_MAXSIZE)
         self._stop_event = threading.Event()
         self._writer_thread: Optional[threading.Thread] = None
         self._poll_thread: Optional[threading.Thread] = None
         self._backfill_thread: Optional[threading.Thread] = None
+        self._repair_thread: Optional[threading.Thread] = None
         self._state_lock = threading.Lock()
         self._windows: dict[str, PolymarketUserTradeWindowState] = {}
         self._active_condition_ids: set[str] = set()
@@ -1229,7 +1273,12 @@ class PolymarketUserTradeCollector:
         self._rows_dropped = 0
 
     def start(self) -> None:
-        if self._writer_thread is not None or self._poll_thread is not None or self._backfill_thread is not None:
+        if (
+            self._writer_thread is not None
+            or self._poll_thread is not None
+            or self._backfill_thread is not None
+            or self._repair_thread is not None
+        ):
             return
         self._writer_thread = threading.Thread(target=self._run_writer, daemon=True, name="pm-usertrade-writer")
         self._backfill_thread = threading.Thread(
@@ -1237,9 +1286,15 @@ class PolymarketUserTradeCollector:
             daemon=True,
             name="pm-usertrade-backfill",
         )
+        self._repair_thread = threading.Thread(
+            target=self._run_repair_worker,
+            daemon=True,
+            name="pm-usertrade-repair",
+        )
         self._poll_thread = threading.Thread(target=self._run_poller, daemon=True, name="pm-usertrade-poller")
         self._writer_thread.start()
         self._backfill_thread.start()
+        self._repair_thread.start()
         self._poll_thread.start()
 
     def stats_snapshot(self) -> dict[str, int]:
@@ -1279,6 +1334,14 @@ class PolymarketUserTradeCollector:
             self._backfill_thread.join(timeout=max(0.0, float(wait_seconds)))
             if self._backfill_thread.is_alive():
                 print("Polymarket user-trade backfill worker still running during shutdown.")
+        try:
+            self._repair_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._repair_thread is not None:
+            self._repair_thread.join(timeout=max(0.0, float(wait_seconds)))
+            if self._repair_thread.is_alive():
+                print("Polymarket user-trade repair worker still running during shutdown.")
         deadline = time.monotonic() + max(0.1, float(wait_seconds))
         while True:
             try:
@@ -1323,6 +1386,21 @@ class PolymarketUserTradeCollector:
                 print(f"Polymarket user-trade backfill worker error: {type(exc).__name__}:{exc}")
             finally:
                 self._backfill_queue.task_done()
+
+    def _run_repair_worker(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                item = self._repair_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                if item is None:
+                    break
+                self._repair_condition(item)
+            except Exception as exc:
+                print(f"Polymarket user-trade repair worker error: {type(exc).__name__}:{exc}")
+            finally:
+                self._repair_queue.task_done()
 
     def _run_poller(self) -> None:
         try:
@@ -1413,12 +1491,7 @@ class PolymarketUserTradeCollector:
                     poll_lag_ms=poll_lag_ms,
                     emit_audit=True,
                 )
-            self._fetch_and_process_page(
-                condition_id=condition_id,
-                limit=PM_USER_TRADES_LIVE_LIMIT,
-                offset=0,
-                collection_mode="live_poll",
-            )
+            self._catch_up_condition_live(condition_id, collection_mode="live_poll")
 
     def _backfill_condition(self, condition_id: str, collection_mode: str) -> None:
         try:
@@ -1429,24 +1502,28 @@ class PolymarketUserTradeCollector:
                 outcome_state.backfill_applied = True
 
             reached_boundary = False
+            exhausted_offset = False
             offset = 0
             page_count = 0
             earliest_needed_ts = int(window.window_open_ts) - PM_USER_TRADES_BACKFILL_MARGIN_SECONDS
+            limit = int(self.config.pm_user_trades_backfill_limit)
 
             while (
                 not self._stop_event.is_set()
-                and page_count < PM_USER_TRADES_BACKFILL_PAGE_CAP
-                and offset <= PM_USER_TRADES_BACKFILL_MAX_OFFSET
+                and page_count < int(self.config.pm_user_trades_backfill_page_cap)
+                and offset <= int(self.config.pm_user_trades_api_max_offset)
             ):
-                page_count += 1
-                trades, ok = self._fetch_and_process_page(
+                self._set_window_max_offset(condition_id, offset)
+                trades, ok = self._fetch_trade_page(
                     condition_id=condition_id,
-                    limit=PM_USER_TRADES_BACKFILL_LIMIT,
+                    limit=limit,
                     offset=offset,
-                    collection_mode=collection_mode,
                 )
                 if not ok:
                     return
+                self._record_page_fetch(condition_id, collection_mode)
+                page_count += 1
+                self._process_trade_page(condition_id, trades, collection_mode)
                 if not trades:
                     reached_boundary = True
                     break
@@ -1462,34 +1539,168 @@ class PolymarketUserTradeCollector:
                 if oldest_trade_ts is not None and oldest_trade_ts <= float(earliest_needed_ts):
                     reached_boundary = True
                     break
-                if len(trades) < PM_USER_TRADES_BACKFILL_LIMIT:
+                if len(trades) < limit:
                     reached_boundary = True
                     break
-                offset += PM_USER_TRADES_BACKFILL_LIMIT
+                next_offset = offset + limit
+                if next_offset > int(self.config.pm_user_trades_api_max_offset):
+                    exhausted_offset = True
+                    break
+                offset = next_offset
 
             if not reached_boundary:
-                self._mark_condition_degraded(condition_id, "page_cap_hit", suspected_gap=True, emit_audit=True)
+                reason = "backfill_offset_cap_hit" if exhausted_offset else "backfill_page_cap_hit"
+                self._mark_condition_degraded(condition_id, reason, suspected_gap=True, emit_audit=True)
         finally:
             with self._state_lock:
                 self._backfill_pending_condition_ids.discard(str(condition_id or "").strip())
             self._finalize_closed_windows(int(time.time()))
 
-    def _fetch_and_process_page(
+    def _enqueue_repair(self, condition_id: str) -> bool:
+        condition = str(condition_id or "").strip()
+        if not condition:
+            return False
+        with self._state_lock:
+            window = self._windows.get(condition)
+            if window is None:
+                return False
+            if window.repair_requested or window.repair_pending or window.repair_completed:
+                return False
+            if not self._window_needs_repair(window):
+                return False
+            window.repair_requested = True
+            window.repair_pending = True
+        self._repair_queue.put(condition)
+        return True
+
+    def _catch_up_condition_live(self, condition_id: str, collection_mode: str) -> bool:
+        prior_newest_trade_ts, prior_newest_trade_key = self._snapshot_window_watermark(condition_id)
+        limit = int(self.config.pm_user_trades_live_limit)
+        offset = 0
+        page_count = 0
+        reached_boundary = False
+
+        while (
+            not self._stop_event.is_set()
+            and page_count < int(self.config.pm_user_trades_live_page_cap)
+            and offset <= int(self.config.pm_user_trades_api_max_offset)
+        ):
+            self._set_window_max_offset(condition_id, offset)
+            trades, ok = self._fetch_trade_page(condition_id=condition_id, limit=limit, offset=offset)
+            if not ok:
+                return False
+            self._record_page_fetch(condition_id, collection_mode)
+            page_count += 1
+            self._process_trade_page(condition_id, trades, collection_mode)
+
+            if not trades:
+                reached_boundary = True
+                break
+
+            oldest_trade_ts: Optional[float] = None
+            saw_prior_newest = False
+            for trade in trades:
+                trade_ts = coerce_float(trade.get("timestamp"))
+                if trade_ts is not None and (oldest_trade_ts is None or trade_ts < oldest_trade_ts):
+                    oldest_trade_ts = trade_ts
+                if prior_newest_trade_key and self._trade_dedupe_key(condition_id, trade) == prior_newest_trade_key:
+                    saw_prior_newest = True
+
+            if len(trades) < limit or saw_prior_newest:
+                reached_boundary = True
+                break
+            if (
+                prior_newest_trade_ts is not None
+                and oldest_trade_ts is not None
+                and oldest_trade_ts < float(prior_newest_trade_ts)
+            ):
+                reached_boundary = True
+                break
+
+            next_offset = offset + limit
+            if next_offset > int(self.config.pm_user_trades_api_max_offset):
+                break
+            offset = next_offset
+
+        if not reached_boundary and not self._stop_event.is_set():
+            self._mark_condition_degraded(condition_id, "live_page_cap_hit", suspected_gap=True, emit_audit=True)
+        return True
+
+    def _repair_condition(self, condition_id: str) -> None:
+        try:
+            wallets = self._snapshot_repair_wallets(condition_id)
+            if not wallets:
+                return
+
+            limit = int(self.config.pm_user_trades_api_max_limit)
+            for wallet in wallets:
+                if self._stop_event.is_set():
+                    break
+                self._increment_repair_wallets_attempted(condition_id)
+                wallet_had_new_rows = False
+                reached_boundary = False
+                fetch_failed = False
+                offset = 0
+                page_count = 0
+
+                while (
+                    not self._stop_event.is_set()
+                    and page_count < int(self.config.pm_user_trades_repair_page_cap)
+                    and offset <= int(self.config.pm_user_trades_api_max_offset)
+                ):
+                    before_rows_written = self._total_rows_written(condition_id)
+                    self._set_window_max_offset(condition_id, offset)
+                    trades, ok = self._fetch_trade_page(
+                        condition_id=condition_id,
+                        limit=limit,
+                        offset=offset,
+                        user=wallet,
+                    )
+                    if not ok:
+                        fetch_failed = True
+                        break
+                    self._record_page_fetch(condition_id, "repair")
+                    page_count += 1
+                    self._process_trade_page(condition_id, trades, "repair")
+                    if self._total_rows_written(condition_id) > before_rows_written:
+                        wallet_had_new_rows = True
+
+                    if not trades or len(trades) < limit:
+                        reached_boundary = True
+                        break
+
+                    next_offset = offset + limit
+                    if next_offset > int(self.config.pm_user_trades_api_max_offset):
+                        break
+                    offset = next_offset
+
+                if wallet_had_new_rows:
+                    self._record_repair_wallet_with_new_rows(condition_id)
+                if not reached_boundary and not fetch_failed and not self._stop_event.is_set():
+                    self._mark_condition_degraded(condition_id, "repair_page_cap_hit", suspected_gap=True, emit_audit=True)
+        finally:
+            self._finish_repair(condition_id)
+            self._finalize_closed_windows(int(time.time()))
+
+    def _fetch_trade_page(
         self,
         condition_id: str,
         limit: int,
         offset: int,
-        collection_mode: str,
+        user: str | None = None,
     ) -> tuple[list[dict[str, Any]], bool]:
+        params: dict[str, Any] = {
+            "market": condition_id,
+            "limit": int(limit),
+            "offset": int(offset),
+            "takerOnly": "false",
+        }
+        if user:
+            params["user"] = str(user).strip()
         try:
             response = self._session.get(
                 POLY_TRADES_URL,
-                params={
-                    "market": condition_id,
-                    "limit": int(limit),
-                    "offset": int(offset),
-                    "takerOnly": "false",
-                },
+                params=params,
                 timeout=self.config.http_timeout_seconds,
             )
         except Exception as exc:
@@ -1500,7 +1711,8 @@ class PolymarketUserTradeCollector:
                 api_error_increment=1,
                 emit_audit=True,
             )
-            print(f"Polymarket user-trade fetch failed condition={condition_id}: {type(exc).__name__}:{exc}")
+            user_suffix = f" user={user}" if user else ""
+            print(f"Polymarket user-trade fetch failed condition={condition_id}{user_suffix}: {type(exc).__name__}:{exc}")
             return [], False
 
         if not response.ok:
@@ -1516,7 +1728,8 @@ class PolymarketUserTradeCollector:
                 text = text[:200] + "..."
             print(
                 "Polymarket user-trade fetch failed "
-                f"condition={condition_id} status={response.status_code} detail={text}"
+                f"condition={condition_id}"
+                f"{f' user={user}' if user else ''} status={response.status_code} detail={text}"
             )
             return [], False
 
@@ -1530,7 +1743,11 @@ class PolymarketUserTradeCollector:
                 api_error_increment=1,
                 emit_audit=True,
             )
-            print(f"Polymarket user-trade json decode failed condition={condition_id}: {type(exc).__name__}:{exc}")
+            user_suffix = f" user={user}" if user else ""
+            print(
+                f"Polymarket user-trade json decode failed condition={condition_id}{user_suffix}: "
+                f"{type(exc).__name__}:{exc}"
+            )
             return [], False
 
         if isinstance(payload, dict):
@@ -1548,12 +1765,9 @@ class PolymarketUserTradeCollector:
             return [], False
 
         trades = [row for row in raw_rows if isinstance(row, dict)]
-        window = self._window_for_condition(condition_id)
-        if window is None:
-            return trades, True
-        for outcome_state in window.outcomes.values():
-            outcome_state.pages_fetched += 1
+        return trades, True
 
+    def _process_trade_page(self, condition_id: str, trades: list[dict[str, Any]], collection_mode: str) -> None:
         observed_at_ts = time.time()
         ordered = sorted(
             trades,
@@ -1565,7 +1779,6 @@ class PolymarketUserTradeCollector:
         )
         for trade in ordered:
             self._process_trade(trade, observed_at_ts, collection_mode)
-        return trades, True
 
     def _process_trade(self, trade: dict[str, Any], observed_at_ts: float, collection_mode: str) -> None:
         condition_id = str(trade.get("conditionId") or trade.get("condition_id") or "").strip()
@@ -1581,11 +1794,12 @@ class PolymarketUserTradeCollector:
         if float(trade_ts) < float(window.window_open_ts) or float(trade_ts) > float(window.window_close_ts):
             return
 
+        dedupe_key = self._trade_dedupe_key(condition_id, trade)
+        self._record_trade_observation(window, trade_ts, dedupe_key, trade.get("proxyWallet"))
         outcome_state = self._outcome_state_for_trade(window, trade)
         if outcome_state is None:
             return
 
-        dedupe_key = self._trade_dedupe_key(condition_id, trade)
         if self._seen_trade(condition_id, dedupe_key):
             outcome_state.rows_deduped += 1
             return
@@ -1602,6 +1816,104 @@ class PolymarketUserTradeCollector:
     def _window_for_condition(self, condition_id: str) -> Optional[PolymarketUserTradeWindowState]:
         with self._state_lock:
             return self._windows.get(str(condition_id or "").strip())
+
+    def _snapshot_window_watermark(self, condition_id: str) -> tuple[float | None, str]:
+        with self._state_lock:
+            window = self._windows.get(str(condition_id or "").strip())
+            if window is None:
+                return None, ""
+            return window.newest_trade_ts_seen, str(window.newest_trade_dedupe_key or "")
+
+    def _set_window_max_offset(self, condition_id: str, offset: int) -> None:
+        with self._state_lock:
+            window = self._windows.get(str(condition_id or "").strip())
+            if window is None:
+                return
+            window.max_offset_reached = max(int(window.max_offset_reached), int(offset))
+
+    def _record_page_fetch(self, condition_id: str, collection_mode: str) -> None:
+        counter_field = {
+            "live_poll": "live_pages_fetched",
+            "startup_backfill": "startup_backfill_pages_fetched",
+            "overlap_backfill": "overlap_backfill_pages_fetched",
+            "final_catchup": "final_catchup_pages_fetched",
+            "repair": "repair_pages_fetched",
+        }.get(str(collection_mode or ""))
+        with self._state_lock:
+            window = self._windows.get(str(condition_id or "").strip())
+            if window is None:
+                return
+            if counter_field:
+                setattr(window, counter_field, int(getattr(window, counter_field, 0)) + 1)
+            for outcome_state in window.outcomes.values():
+                outcome_state.pages_fetched += 1
+
+    def _record_trade_observation(
+        self,
+        window: PolymarketUserTradeWindowState,
+        trade_ts: float,
+        dedupe_key: str,
+        wallet_value: Any,
+    ) -> None:
+        wallet = str(wallet_value or "").strip()
+        with self._state_lock:
+            if window.oldest_trade_ts_seen is None or float(trade_ts) < float(window.oldest_trade_ts_seen):
+                window.oldest_trade_ts_seen = float(trade_ts)
+            if window.newest_trade_ts_seen is None or float(trade_ts) > float(window.newest_trade_ts_seen):
+                window.newest_trade_ts_seen = float(trade_ts)
+                window.newest_trade_dedupe_key = str(dedupe_key or "")
+            elif (
+                float(trade_ts) == float(window.newest_trade_ts_seen)
+                and str(dedupe_key or "") > str(window.newest_trade_dedupe_key or "")
+            ):
+                window.newest_trade_dedupe_key = str(dedupe_key or "")
+            if wallet and wallet not in window.observed_wallets:
+                window.observed_wallets[wallet] = None
+
+    def _total_rows_written(self, condition_id: str) -> int:
+        with self._state_lock:
+            window = self._windows.get(str(condition_id or "").strip())
+            if window is None:
+                return 0
+            return int(sum(int(outcome_state.rows_written) for outcome_state in window.outcomes.values()))
+
+    def _snapshot_repair_wallets(self, condition_id: str) -> list[str]:
+        with self._state_lock:
+            window = self._windows.get(str(condition_id or "").strip())
+            if window is None:
+                return []
+            wallets = list(window.observed_wallets.keys())
+        return wallets[: int(self.config.pm_user_trades_repair_wallet_cap)]
+
+    def _increment_repair_wallets_attempted(self, condition_id: str) -> None:
+        with self._state_lock:
+            window = self._windows.get(str(condition_id or "").strip())
+            if window is None:
+                return
+            window.repair_wallets_attempted += 1
+
+    def _record_repair_wallet_with_new_rows(self, condition_id: str) -> None:
+        with self._state_lock:
+            window = self._windows.get(str(condition_id or "").strip())
+            if window is None:
+                return
+            window.repair_wallets_with_new_rows += 1
+            window.repair_applied = True
+
+    def _finish_repair(self, condition_id: str) -> None:
+        with self._state_lock:
+            window = self._windows.get(str(condition_id or "").strip())
+            if window is None:
+                return
+            window.repair_pending = False
+            window.repair_completed = True
+
+    def _set_final_catchup_applied(self, condition_id: str) -> None:
+        with self._state_lock:
+            window = self._windows.get(str(condition_id or "").strip())
+            if window is None:
+                return
+            window.final_catchup_applied = True
 
     def _outcome_state_for_trade(
         self,
@@ -1640,13 +1952,14 @@ class PolymarketUserTradeCollector:
         return "|".join(parts)
 
     def _seen_trade(self, condition_id: str, dedupe_key: str) -> bool:
-        seen = self._dedupe_by_condition.setdefault(str(condition_id), OrderedDict())
-        if dedupe_key in seen:
-            seen.move_to_end(dedupe_key)
-            return True
-        seen[dedupe_key] = None
-        while len(seen) > PM_USER_TRADES_DEDUPE_MAX_KEYS_PER_CONDITION:
-            seen.popitem(last=False)
+        with self._state_lock:
+            seen = self._dedupe_by_condition.setdefault(str(condition_id), OrderedDict())
+            if dedupe_key in seen:
+                seen.move_to_end(dedupe_key)
+                return True
+            seen[dedupe_key] = None
+            while len(seen) > PM_USER_TRADES_DEDUPE_MAX_KEYS_PER_CONDITION:
+                seen.popitem(last=False)
         return False
 
     def _mark_condition_degraded(
@@ -1658,18 +1971,21 @@ class PolymarketUserTradeCollector:
         poll_lag_ms: int = 0,
         emit_audit: bool = False,
     ) -> None:
-        window = self._window_for_condition(condition_id)
-        if window is None:
-            return
         now_ts = time.time()
-        for outcome_state in window.outcomes.values():
-            if api_error_increment > 0:
-                outcome_state.api_error_count += int(api_error_increment)
-            if poll_lag_ms > 0:
-                outcome_state.poll_lag_ms_max = max(outcome_state.poll_lag_ms_max, int(poll_lag_ms))
-            self._mark_outcome_degraded(outcome_state, reason, suspected_gap=suspected_gap)
-            if emit_audit:
-                self._emit_audit_row(outcome_state, now_ts, force=False)
+        with self._state_lock:
+            window = self._windows.get(str(condition_id or "").strip())
+            if window is None:
+                return
+            outcomes = list(window.outcomes.values())
+            for outcome_state in outcomes:
+                if api_error_increment > 0:
+                    outcome_state.api_error_count += int(api_error_increment)
+                if poll_lag_ms > 0:
+                    outcome_state.poll_lag_ms_max = max(outcome_state.poll_lag_ms_max, int(poll_lag_ms))
+                self._mark_outcome_degraded(outcome_state, reason, suspected_gap=suspected_gap)
+        if emit_audit:
+            for outcome_state in outcomes:
+                self._emit_audit_row(outcome_state, now_ts, force=False, window=window)
 
     @staticmethod
     def _mark_outcome_degraded(
@@ -1732,11 +2048,13 @@ class PolymarketUserTradeCollector:
         outcome_state: PolymarketUserTradeOutcomeState,
         emitted_at_ts: float,
         final_window_audit: bool,
+        window: Optional[PolymarketUserTradeWindowState],
     ) -> dict[str, Any]:
         ts_value = float(outcome_state.window_close_ts) if final_window_audit else max(
             float(outcome_state.window_open_ts),
             min(float(emitted_at_ts), float(outcome_state.window_close_ts)),
         )
+        pages_fetched = self._window_pages_fetched(window)
         return {
             "ts_utc": to_iso_utc(ts_value),
             "row_type": "audit",
@@ -1753,7 +2071,21 @@ class PolymarketUserTradeCollector:
             "capture_reason": str(outcome_state.capture_reason or ""),
             "suspected_gap": bool(outcome_state.suspected_gap),
             "api_error_count": int(outcome_state.api_error_count),
-            "pages_fetched": int(outcome_state.pages_fetched),
+            "pages_fetched": int(pages_fetched),
+            "live_pages_fetched": int(window.live_pages_fetched) if window is not None else 0,
+            "startup_backfill_pages_fetched": int(window.startup_backfill_pages_fetched) if window is not None else 0,
+            "overlap_backfill_pages_fetched": int(window.overlap_backfill_pages_fetched) if window is not None else 0,
+            "final_catchup_pages_fetched": int(window.final_catchup_pages_fetched) if window is not None else 0,
+            "repair_pages_fetched": int(window.repair_pages_fetched) if window is not None else 0,
+            "repair_wallets_attempted": int(window.repair_wallets_attempted) if window is not None else 0,
+            "repair_wallets_with_new_rows": int(window.repair_wallets_with_new_rows) if window is not None else 0,
+            "max_offset_reached": int(window.max_offset_reached) if window is not None else 0,
+            "oldest_trade_ts_seen": float(window.oldest_trade_ts_seen) if window and window.oldest_trade_ts_seen is not None else "",
+            "newest_trade_ts_seen": float(window.newest_trade_ts_seen) if window and window.newest_trade_ts_seen is not None else "",
+            "final_catchup_applied": bool(window.final_catchup_applied) if window is not None else False,
+            "repair_applied": bool(window.repair_applied) if window is not None else False,
+            "repair_pending": bool(window.repair_pending) if window is not None else False,
+            "resolver_returned_slug": str(window.resolver_returned_slug or "") if window is not None else "",
             "rows_written": int(outcome_state.rows_written),
             "rows_deduped": int(outcome_state.rows_deduped),
             "queue_overflow_count": int(outcome_state.queue_overflow_count),
@@ -1766,6 +2098,7 @@ class PolymarketUserTradeCollector:
         outcome_state: PolymarketUserTradeOutcomeState,
         emitted_at_ts: float,
         force: bool,
+        window: Optional[PolymarketUserTradeWindowState] = None,
     ) -> None:
         reason_key = str(outcome_state.capture_reason or "")
         now_monotonic = time.monotonic()
@@ -1775,7 +2108,9 @@ class PolymarketUserTradeCollector:
                 and (now_monotonic - float(outcome_state.last_audit_monotonic)) < PM_USER_TRADES_AUDIT_COOLDOWN_SECONDS
             ):
                 return
-        row = self._build_audit_row(outcome_state, emitted_at_ts, final_window_audit=force)
+        if window is None:
+            window = self._window_for_condition(outcome_state.condition_id)
+        row = self._build_audit_row(outcome_state, emitted_at_ts, final_window_audit=force, window=window)
         if self._enqueue_row(row, is_audit=True):
             outcome_state.last_audit_reason = reason_key
             outcome_state.last_audit_monotonic = now_monotonic
@@ -1794,26 +2129,69 @@ class PolymarketUserTradeCollector:
                 self._audit_rows_enqueued += 1
         return True
 
+    @staticmethod
+    def _window_needs_repair(window: PolymarketUserTradeWindowState) -> bool:
+        return bool(window.observed_wallets) and any(bool(outcome_state.suspected_gap) for outcome_state in window.outcomes.values())
+
+    @staticmethod
+    def _window_pages_fetched(window: Optional[PolymarketUserTradeWindowState]) -> int:
+        if window is None:
+            return 0
+        return int(
+            window.live_pages_fetched
+            + window.startup_backfill_pages_fetched
+            + window.overlap_backfill_pages_fetched
+            + window.final_catchup_pages_fetched
+            + window.repair_pages_fetched
+        )
+
+    def _remove_window(self, condition_id: str) -> Optional[PolymarketUserTradeWindowState]:
+        with self._state_lock:
+            condition = str(condition_id or "").strip()
+            window = self._windows.pop(condition, None)
+            self._dedupe_by_condition.pop(condition, None)
+            return window
+
     def _finalize_closed_windows(self, now_ts: int) -> None:
         with self._state_lock:
             active_condition_ids = set(self._active_condition_ids)
             backfill_pending_condition_ids = set(self._backfill_pending_condition_ids)
-            closed_items = [
-                (condition_id, window)
+            closed_condition_ids = [
+                condition_id
                 for condition_id, window in self._windows.items()
                 if (
                     int(now_ts) >= int(window.window_close_ts)
                     and condition_id not in active_condition_ids
                     and condition_id not in backfill_pending_condition_ids
+                    and not window.repair_pending
                 )
             ]
-            for condition_id, _window in closed_items:
-                self._windows.pop(condition_id, None)
-                self._dedupe_by_condition.pop(condition_id, None)
 
-        for _condition_id, window in closed_items:
+        finalizable_condition_ids: list[str] = []
+        for condition_id in closed_condition_ids:
+            window = self._window_for_condition(condition_id)
+            if window is None:
+                continue
+            if self.config.pm_user_trades_final_catchup_enabled and not window.final_catchup_applied:
+                self._catch_up_condition_live(condition_id, collection_mode="final_catchup")
+                self._set_final_catchup_applied(condition_id)
+                continue
+            if (
+                self.config.pm_user_trades_repair_enabled
+                and not window.repair_pending
+                and not window.repair_completed
+                and self._window_needs_repair(window)
+            ):
+                if self._enqueue_repair(condition_id):
+                    continue
+            finalizable_condition_ids.append(condition_id)
+
+        for condition_id in finalizable_condition_ids:
+            window = self._remove_window(condition_id)
+            if window is None:
+                continue
             for outcome_state in window.outcomes.values():
-                self._emit_audit_row(outcome_state, float(window.window_close_ts), force=True)
+                self._emit_audit_row(outcome_state, float(window.window_close_ts), force=True, window=window)
 
 
 @dataclass
@@ -2527,6 +2905,73 @@ def build_collector_config(args: argparse.Namespace, runtime_cfg: RuntimeConfig)
         raise RuntimeError(f"restart_schedule_s_invalid:{restart_schedule_s}")
 
     pm_user_trades_enabled = parse_env_bool("PM_USER_TRADES_ENABLED", False)
+    pm_user_trades_api_max_limit_raw = normalize_env_scalar(os.getenv("PM_USER_TRADES_API_MAX_LIMIT"))
+    try:
+        pm_user_trades_api_max_limit = int(pm_user_trades_api_max_limit_raw) if pm_user_trades_api_max_limit_raw else 500
+    except ValueError:
+        pm_user_trades_api_max_limit = 500
+    pm_user_trades_api_max_limit = max(1, pm_user_trades_api_max_limit)
+
+    pm_user_trades_api_max_offset_raw = normalize_env_scalar(os.getenv("PM_USER_TRADES_API_MAX_OFFSET"))
+    try:
+        pm_user_trades_api_max_offset = int(pm_user_trades_api_max_offset_raw) if pm_user_trades_api_max_offset_raw else 1000
+    except ValueError:
+        pm_user_trades_api_max_offset = 1000
+    pm_user_trades_api_max_offset = max(0, pm_user_trades_api_max_offset)
+
+    pm_user_trades_live_limit_raw = normalize_env_scalar(os.getenv("PM_USER_TRADES_LIVE_LIMIT"))
+    try:
+        pm_user_trades_live_limit = int(pm_user_trades_live_limit_raw) if pm_user_trades_live_limit_raw else pm_user_trades_api_max_limit
+    except ValueError:
+        pm_user_trades_live_limit = pm_user_trades_api_max_limit
+    pm_user_trades_live_limit = max(1, min(pm_user_trades_api_max_limit, pm_user_trades_live_limit))
+
+    pm_user_trades_backfill_limit_raw = normalize_env_scalar(os.getenv("PM_USER_TRADES_BACKFILL_LIMIT"))
+    try:
+        pm_user_trades_backfill_limit = (
+            int(pm_user_trades_backfill_limit_raw) if pm_user_trades_backfill_limit_raw else pm_user_trades_api_max_limit
+        )
+    except ValueError:
+        pm_user_trades_backfill_limit = pm_user_trades_api_max_limit
+    pm_user_trades_backfill_limit = max(1, min(pm_user_trades_api_max_limit, pm_user_trades_backfill_limit))
+
+    pm_user_trades_live_page_cap_raw = normalize_env_scalar(os.getenv("PM_USER_TRADES_LIVE_PAGE_CAP"))
+    try:
+        pm_user_trades_live_page_cap = int(pm_user_trades_live_page_cap_raw) if pm_user_trades_live_page_cap_raw else 3
+    except ValueError:
+        pm_user_trades_live_page_cap = 3
+    pm_user_trades_live_page_cap = max(1, pm_user_trades_live_page_cap)
+
+    pm_user_trades_backfill_page_cap_raw = normalize_env_scalar(os.getenv("PM_USER_TRADES_BACKFILL_PAGE_CAP"))
+    try:
+        pm_user_trades_backfill_page_cap = (
+            int(pm_user_trades_backfill_page_cap_raw) if pm_user_trades_backfill_page_cap_raw else 20
+        )
+    except ValueError:
+        pm_user_trades_backfill_page_cap = 20
+    pm_user_trades_backfill_page_cap = max(1, pm_user_trades_backfill_page_cap)
+
+    pm_user_trades_repair_enabled = parse_env_bool("PM_USER_TRADES_REPAIR_ENABLED", True)
+
+    pm_user_trades_repair_wallet_cap_raw = normalize_env_scalar(os.getenv("PM_USER_TRADES_REPAIR_WALLET_CAP"))
+    try:
+        pm_user_trades_repair_wallet_cap = (
+            int(pm_user_trades_repair_wallet_cap_raw) if pm_user_trades_repair_wallet_cap_raw else 250
+        )
+    except ValueError:
+        pm_user_trades_repair_wallet_cap = 250
+    pm_user_trades_repair_wallet_cap = max(1, pm_user_trades_repair_wallet_cap)
+
+    pm_user_trades_repair_page_cap_raw = normalize_env_scalar(os.getenv("PM_USER_TRADES_REPAIR_PAGE_CAP"))
+    try:
+        pm_user_trades_repair_page_cap = (
+            int(pm_user_trades_repair_page_cap_raw) if pm_user_trades_repair_page_cap_raw else 3
+        )
+    except ValueError:
+        pm_user_trades_repair_page_cap = 3
+    pm_user_trades_repair_page_cap = max(1, pm_user_trades_repair_page_cap)
+
+    pm_user_trades_final_catchup_enabled = parse_env_bool("PM_USER_TRADES_FINAL_CATCHUP_ENABLED", True)
 
     if graph_upload_enabled:
         missing: list[str] = []
@@ -2578,6 +3023,16 @@ def build_collector_config(args: argparse.Namespace, runtime_cfg: RuntimeConfig)
         graph_token_cache_path=graph_token_cache_path,
         restart_schedule_s=restart_schedule_s,
         pm_user_trades_enabled=pm_user_trades_enabled,
+        pm_user_trades_api_max_limit=pm_user_trades_api_max_limit,
+        pm_user_trades_api_max_offset=pm_user_trades_api_max_offset,
+        pm_user_trades_live_limit=pm_user_trades_live_limit,
+        pm_user_trades_backfill_limit=pm_user_trades_backfill_limit,
+        pm_user_trades_live_page_cap=pm_user_trades_live_page_cap,
+        pm_user_trades_backfill_page_cap=pm_user_trades_backfill_page_cap,
+        pm_user_trades_repair_enabled=pm_user_trades_repair_enabled,
+        pm_user_trades_repair_wallet_cap=pm_user_trades_repair_wallet_cap,
+        pm_user_trades_repair_page_cap=pm_user_trades_repair_page_cap,
+        pm_user_trades_final_catchup_enabled=pm_user_trades_final_catchup_enabled,
     )
 
 
